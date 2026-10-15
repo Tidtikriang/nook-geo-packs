@@ -1,0 +1,711 @@
+name: geo-packs
+
+# NooK offline place packs, built from OpenStreetMap (Geofabrik extracts) and
+# published as a Release of THIS public repository. Self-contained: the
+# build scripts are embedded below (generated from tool/geo in the NooK app
+# repository by make_standalone_workflow.py). No secrets or settings needed.
+#
+# Actions -> geo-packs -> Run workflow. Leave "only" empty for every country,
+# or enter Geofabrik ids such as "thailand" for a quick run.
+#
+# Map data (c) OpenStreetMap contributors, ODbL 1.0.
+on:
+  workflow_dispatch:
+    inputs:
+      only:
+        description: 'Optional comma-separated Geofabrik ids (empty = every country)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  TARGET_REPO: ${{ github.repository }}
+  TAG: geo-${{ github.run_id }}
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      a: ${{ steps.plan.outputs.a }}
+      b: ${{ steps.plan.outputs.b }}
+    steps:
+      - name: Write build scripts
+        run: |
+          mkdir -p tool/geo
+          cat > tool/geo/pack_schema.py <<'NOOK_SCRIPT_EOF'
+          """Shared format of NooK offline place packs (SQLite, read-only, public data).
+
+          A pack is plain SQLite (OSM data is public; nothing user-specific is ever
+          written to it). The app keeps the same schema in
+          lib/features/location/place_pack.dart; bump FORMAT on any change.
+          """
+          import json
+          import math
+          import re
+          import sqlite3
+
+          FORMAT = 1
+
+          # Country packs keep every translation OpenStreetMap has: most places carry
+          # only their local name, so this costs little and serves every NooK user.
+          # The bundled world pack keeps these 40 major languages, because famous
+          # landmarks carry 100+ translations each and the bundle must stay small.
+          WORLD_LANGS = (
+              "en", "zh", "zh-Hans", "zh-Hant", "es", "ar", "hi", "bn", "pt", "ru", "ja", "de", "fr", "ko", "it",
+              "tr", "vi", "th", "id", "ms", "fa", "ur", "ta", "pl", "uk", "nl", "ro", "el", "cs", "sv", "hu", "he",
+              "da", "fi", "no", "ca", "tl", "km", "lo", "my",
+          )
+          assert len(WORLD_LANGS) == 40
+
+          # BCP-47-ish keys as used in OSM `name:xx` tags: `fr`, `zh-Hant`, `sr-Latn`.
+          _LANG_KEY = re.compile(r"^[a-z]{2,3}(-[A-Z][a-z]{3}|-[A-Za-z]{2})?$")
+
+
+          def valid_lang(code: str) -> bool:
+              return bool(_LANG_KEY.match(code))
+
+          POI_TILE = 0.01   # ~1.1 km
+          LOC_TILE = 0.2    # ~22 km
+
+          SCHEMA = """
+          CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+          CREATE TABLE places (
+            id      INTEGER PRIMARY KEY,
+            tile    INTEGER NOT NULL,
+            lat     REAL NOT NULL,
+            lon     REAL NOT NULL,
+            kind    TEXT NOT NULL,
+            rank    INTEGER NOT NULL,
+            name    TEXT NOT NULL,
+            names   TEXT,
+            cc      TEXT
+          );
+          CREATE INDEX places_tile ON places(tile);
+          CREATE TABLE localities (
+            id         INTEGER PRIMARY KEY,
+            tile       INTEGER NOT NULL,
+            lat        REAL NOT NULL,
+            lon        REAL NOT NULL,
+            kind       TEXT NOT NULL,
+            name       TEXT NOT NULL,
+            names      TEXT,
+            population INTEGER,
+            cc         TEXT
+          );
+          CREATE INDEX localities_tile ON localities(tile);
+          CREATE TABLE countries (cc TEXT PRIMARY KEY, name TEXT NOT NULL, names TEXT);
+          """
+
+
+          def tile(lat: float, lon: float, size: float) -> int:
+              cols = int(round(360 / size))
+              return int(math.floor((lat + 90) / size)) * cols + int(math.floor((lon + 180) / size))
+
+
+          def names_json(names: dict, langs=None) -> str | None:
+              kept = {k: v for k, v in names.items() if v and valid_lang(k) and (langs is None or k in langs)}
+              return json.dumps(kept, ensure_ascii=False, separators=(",", ":"), sort_keys=True) if kept else None
+
+
+          def create(path: str, meta: dict) -> sqlite3.Connection:
+              db = sqlite3.connect(path)
+              db.executescript(SCHEMA)
+              db.executemany("INSERT INTO meta VALUES (?, ?)", [(k, str(v)) for k, v in {"format": FORMAT, **meta}.items()])
+              return db
+
+
+          def insert_place(db, lat, lon, kind, rank, name, names, cc, langs=None):
+              db.execute(
+                  "INSERT INTO places (tile, lat, lon, kind, rank, name, names, cc) VALUES (?,?,?,?,?,?,?,?)",
+                  (tile(lat, lon, POI_TILE), round(lat, 6), round(lon, 6), kind, rank, name, names_json(names, langs), cc),
+              )
+
+
+          def insert_locality(db, lat, lon, kind, name, names, population, cc, langs=None):
+              db.execute(
+                  "INSERT INTO localities (tile, lat, lon, kind, name, names, population, cc) VALUES (?,?,?,?,?,?,?,?)",
+                  (tile(lat, lon, LOC_TILE), round(lat, 5), round(lon, 5), kind, name, names_json(names, langs), population, cc),
+              )
+
+
+          def insert_country(db, cc, name, names, langs=None):
+              db.execute("INSERT OR REPLACE INTO countries VALUES (?,?,?)", (cc, name, names_json(names, langs)))
+
+
+          def finish(db) -> None:
+              db.commit()
+              db.execute("ANALYZE")
+              db.commit()
+              db.execute("VACUUM")
+              db.close()
+          NOOK_SCRIPT_EOF
+          cat > tool/geo/build_pack.py <<'NOOK_SCRIPT_EOF'
+          #!/usr/bin/env python3
+          """Build one NooK place pack from an OpenStreetMap extract (.osm.pbf).
+
+              python3 tool/geo/build_pack.py thailand-latest.osm.pbf --id th --cc TH \
+                  --out th.sqlite --landmarks th.landmarks.jsonl
+
+          Outputs
+            * the country pack: every named, place-like POI (temples, cafés, viewpoints,
+              beaches, gates, museums...) with every translation OSM has, plus
+              localities (city/town/village/suburb) and the country's own names;
+            * a landmarks file: the most notable POIs and the larger localities, which
+              merge_world.py combines into the small world pack bundled with the app.
+
+          Data (c) OpenStreetMap contributors, ODbL 1.0.
+          """
+          import argparse
+          import json
+          import os
+          import sys
+
+          import osmium
+          from osmium import geom
+
+          sys.path.insert(0, os.path.dirname(__file__))
+          import pack_schema as ps  # noqa: E402
+
+          # (tag key, value or "*") -> (kind shown to users, base rank)
+          POI_KINDS = {
+              ("tourism", "attraction"): ("attraction", 30),
+              ("tourism", "museum"): ("museum", 30),
+              ("tourism", "viewpoint"): ("viewpoint", 22),
+              ("tourism", "gallery"): ("gallery", 15),
+              ("tourism", "zoo"): ("zoo", 28),
+              ("tourism", "aquarium"): ("aquarium", 28),
+              ("tourism", "theme_park"): ("theme_park", 28),
+              ("tourism", "artwork"): ("artwork", 8),
+              ("historic", "castle"): ("castle", 30),
+              ("historic", "city_gate"): ("gate", 30),
+              ("historic", "monument"): ("monument", 28),
+              ("historic", "ruins"): ("ruins", 24),
+              ("historic", "archaeological_site"): ("archaeological_site", 24),
+              ("historic", "fort"): ("fort", 24),
+              ("historic", "palace"): ("palace", 30),
+              ("historic", "temple"): ("temple", 24),
+              ("historic", "memorial"): ("memorial", 8),
+              ("historic", "*"): ("historic", 10),
+              ("amenity", "place_of_worship"): ("place_of_worship", 15),
+              ("amenity", "marketplace"): ("market", 15),
+              ("amenity", "theatre"): ("theatre", 15),
+              ("amenity", "arts_centre"): ("arts_centre", 14),
+              ("amenity", "university"): ("university", 14),
+              ("amenity", "library"): ("library", 10),
+              ("amenity", "fountain"): ("fountain", 10),
+              ("amenity", "cafe"): ("cafe", 5),
+              ("amenity", "restaurant"): ("restaurant", 5),
+              ("amenity", "bar"): ("bar", 3),
+              ("amenity", "cinema"): ("cinema", 5),
+              ("leisure", "park"): ("park", 10),
+              ("leisure", "garden"): ("garden", 14),
+              ("leisure", "nature_reserve"): ("nature_reserve", 14),
+              ("leisure", "stadium"): ("stadium", 15),
+              ("leisure", "beach_resort"): ("beach", 15),
+              ("natural", "peak"): ("peak", 20),
+              ("natural", "volcano"): ("volcano", 30),
+              ("natural", "beach"): ("beach", 20),
+              ("natural", "bay"): ("bay", 14),
+              ("natural", "cape"): ("cape", 14),
+              ("natural", "cave_entrance"): ("cave", 15),
+              ("natural", "glacier"): ("glacier", 24),
+              ("waterway", "waterfall"): ("waterfall", 24),
+              ("man_made", "lighthouse"): ("lighthouse", 20),
+              ("man_made", "tower"): ("tower", 12),
+              ("man_made", "bridge"): ("bridge", 14),
+              ("man_made", "pier"): ("pier", 10),
+              ("building", "cathedral"): ("cathedral", 24),
+              ("building", "temple"): ("temple", 15),
+              ("building", "palace"): ("palace", 24),
+              ("shop", "mall"): ("mall", 10),
+              ("railway", "station"): ("station", 10),
+              ("aeroway", "aerodrome"): ("airport", 12),
+          }
+          KEYS = {k for k, _ in POI_KINDS}
+          LOCALITY_KINDS = {"city", "town", "village", "suburb"}
+
+
+          def osmium_filters() -> list[str]:
+              """Expressions for `osmium tags-filter`, which shrinks a country extract
+              to just the objects this script reads (plus the nodes they reference),
+              so even large countries fit in a CI runner's memory."""
+              by_key: dict[str, set[str]] = {}
+              for key, value in POI_KINDS:
+                  by_key.setdefault(key, set()).add(value)
+              exprs = []
+              for key, values in sorted(by_key.items()):
+                  exprs.append(f"nw/{key}" if "*" in values else f"nw/{key}={','.join(sorted(values))}")
+              exprs.append("n/place=" + ",".join(sorted(LOCALITY_KINDS)))
+              exprs.append("r/boundary=administrative")
+              return exprs
+
+
+          def classify(tags) -> tuple[str, int] | None:
+              best = None
+              for key in KEYS:
+                  value = tags.get(key)
+                  if value is None:
+                      continue
+                  hit = POI_KINDS.get((key, value)) or POI_KINDS.get((key, "*"))
+                  if hit and (best is None or hit[1] > best[1]):
+                      best = hit
+              if best and best[0] == "airport" and "iata" not in tags:
+                  return None  # skip airstrips
+              return best
+
+
+          def localized(tags) -> dict:
+              """Every `name:<lang>` translation on the object."""
+              out = {}
+              for t in tags:
+                  if t.k.startswith("name:"):
+                      lang = t.k[5:]
+                      if ps.valid_lang(lang):
+                          out[lang] = t.v
+              return out
+
+
+          def rank(base: int, tags) -> int:
+              score = base
+              if "wikidata" in tags:
+                  score += 25
+              if "wikipedia" in tags:
+                  score += 15
+              if "heritage" in tags or "whc:inscription_date" in tags:
+                  score += 15
+              languages = sum(1 for t in tags if t.k.startswith("name:"))
+              score += min(20, languages * 2)
+              return min(100, score)
+
+
+          class Handler(osmium.SimpleHandler):
+              def __init__(self, db, ccs, landmark_rank, landmarks):
+                  super().__init__()
+                  self.db, self.ccs, self.cc = db, ccs, ccs[0]
+                  self.landmark_rank = landmark_rank
+                  self.landmarks = landmarks
+                  self.countries = {}
+                  self.count = 0
+
+              def _emit(self, tags, lat, lon):
+                  name = tags.get("name")
+                  if not name:
+                      return
+                  place = tags.get("place")
+                  if place in LOCALITY_KINDS:
+                      pop = tags.get("population", "").replace(",", "").replace(" ", "")
+                      population = int(pop) if pop.isdigit() else None
+                      names = localized(tags)
+                      ps.insert_locality(self.db, lat, lon, place, name, names, population, self.cc)
+                      if place in ("city", "town"):
+                          self.landmarks.append({"t": "loc", "lat": lat, "lon": lon, "kind": place, "name": name,
+                                                 "names": names, "pop": population, "cc": self.cc})
+                      return
+                  hit = classify(tags)
+                  if not hit:
+                      return
+                  kind, base = hit
+                  r = rank(base, tags)
+                  names = localized(tags)
+                  ps.insert_place(self.db, lat, lon, kind, r, name, names, self.cc)
+                  self.count += 1
+                  if r >= self.landmark_rank:
+                      self.landmarks.append({"t": "poi", "lat": lat, "lon": lon, "kind": kind, "rank": r,
+                                             "name": name, "names": names, "cc": self.cc})
+
+              def node(self, n):
+                  if n.tags:
+                      self._emit(n.tags, n.location.lat, n.location.lon)
+
+              def way(self, w):
+                  if not w.tags or "name" not in w.tags:
+                      return
+                  pts = [(nd.lat, nd.lon) for nd in w.nodes if nd.location.valid()]
+                  if not pts:
+                      return
+                  self._emit(w.tags, sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts))
+
+              def relation(self, r):
+                  tags = r.tags
+                  iso = tags.get("ISO3166-1", tags.get("ISO3166-1:alpha2", "")).upper()
+                  if tags.get("boundary") == "administrative" and tags.get("admin_level") == "2" and iso in self.ccs:
+                      self.countries[iso] = (tags.get("name", iso), localized(tags))
+
+
+          class CountryAreas(osmium.SimpleHandler):
+              """Second pass, only for extracts covering several countries
+              (e.g. malaysia-singapore-brunei): assemble each country's boundary so
+              every place gets the right country code."""
+
+              def __init__(self, ccs):
+                  super().__init__()
+                  self.ccs = ccs
+                  self.wkb = geom.WKBFactory()
+                  self.polygons = {}
+
+              def area(self, a):
+                  tags = a.tags
+                  iso = tags.get("ISO3166-1", tags.get("ISO3166-1:alpha2", "")).upper()
+                  if tags.get("admin_level") == "2" and iso in self.ccs and not a.from_way():
+                      try:
+                          self.polygons[iso] = self.wkb.create_multipolygon(a)
+                      except Exception:  # broken boundary in the extract; fall back below
+                          pass
+
+
+          def assign_countries(path: str, pbf: str, ccs: list[str]) -> None:
+              from shapely import wkb as shp_wkb
+              from shapely.geometry import Point
+              from shapely.prepared import prep
+
+              handler = CountryAreas(set(ccs))
+              handler.apply_file(pbf, locations=True, idx="flex_mem")
+              shapes = {cc: prep(shp_wkb.loads(w, hex=True)) for cc, w in handler.polygons.items()}
+              if not shapes:
+                  return
+              import sqlite3
+              db = sqlite3.connect(path)
+              for table in ("places", "localities"):
+                  updates = []
+                  for rowid, lat, lon in db.execute(f"SELECT id, lat, lon FROM {table}"):
+                      pt = Point(lon, lat)
+                      hit = next((cc for cc, shape in shapes.items() if shape.contains(pt)), None)
+                      if hit:
+                          updates.append((hit, rowid))
+                  db.executemany(f"UPDATE {table} SET cc = ? WHERE id = ?", updates)
+              db.commit()
+              db.close()
+
+
+          def main() -> None:
+              if "--print-filters" in sys.argv:
+                  print(" ".join(osmium_filters()))
+                  return
+              ap = argparse.ArgumentParser()
+              ap.add_argument("pbf")
+              ap.add_argument("--id", required=True, help="pack id, e.g. th or us-california")
+              ap.add_argument("--cc", required=True, help="ISO 3166-1 alpha-2 code(s), comma separated")
+              ap.add_argument("--title", default=None, help="human name of the pack")
+              ap.add_argument("--out", required=True)
+              ap.add_argument("--landmarks", required=True)
+              ap.add_argument("--landmark-rank", type=int, default=60)
+              ap.add_argument("--version", default="dev")
+              args = ap.parse_args()
+
+              if os.path.exists(args.out):
+                  os.remove(args.out)
+              ccs = [c.strip().upper() for c in args.cc.split(",") if c.strip()]
+              db = ps.create(args.out, {"id": args.id, "cc": ",".join(ccs), "title": args.title or args.id, "version": args.version,
+                                        "attribution": "(c) OpenStreetMap contributors, ODbL 1.0"})
+              landmarks: list[dict] = []
+              h = Handler(db, ccs, args.landmark_rank, landmarks)
+              # 'flex_mem' keeps node locations for way centroids; fine for country extracts.
+              h.apply_file(args.pbf, locations=True, idx="flex_mem")
+              for iso, (name, names) in h.countries.items():
+                  ps.insert_country(db, iso, name, names)
+                  landmarks.append({"t": "country", "cc": iso, "name": name, "names": names})
+              db.commit()
+              if len(ccs) > 1:
+                  db.close()
+                  assign_countries(args.out, args.pbf, ccs)
+                  import sqlite3
+                  db = sqlite3.connect(args.out)
+                  # Landmark rows were written before polygons were known; re-read cc.
+                  fixed = {(round(r[1], 6), round(r[2], 6), r[0]): r[3]
+                           for r in db.execute("SELECT name, lat, lon, cc FROM places UNION ALL SELECT name, lat, lon, cc FROM localities")}
+                  for row in landmarks:
+                      if row["t"] in ("poi", "loc"):
+                          row["cc"] = fixed.get((round(row["lat"], 6), round(row["lon"], 6), row["name"]), row["cc"])
+              ps.finish(db)
+              with open(args.landmarks, "w", encoding="utf-8") as fh:
+                  for row in landmarks:
+                      fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+              print(f"{args.id}: {h.count} places, {len(landmarks)} landmark rows -> {args.out}", file=sys.stderr)
+
+
+          if __name__ == "__main__":
+              main()
+          NOOK_SCRIPT_EOF
+          cat > tool/geo/merge_world.py <<'NOOK_SCRIPT_EOF'
+          #!/usr/bin/env python3
+          """Merge per-country landmark files into the world pack bundled with NooK.
+
+              python3 tool/geo/merge_world.py out/*.landmarks.jsonl --out world.sqlite
+
+          Keeps at most --per-country POIs per country (highest rank first) and the
+          40 pack_schema.WORLD_LANGS translations, so the bundled pack stays small;
+          full detail and every language live in downloadable country packs.
+          """
+          import argparse
+          import json
+          import os
+          import sys
+          from collections import defaultdict
+
+          sys.path.insert(0, os.path.dirname(__file__))
+          import pack_schema as ps  # noqa: E402
+
+
+          def main() -> None:
+              ap = argparse.ArgumentParser()
+              ap.add_argument("inputs", nargs="+")
+              ap.add_argument("--out", required=True)
+              ap.add_argument("--per-country", type=int, default=1500)
+              ap.add_argument("--version", default="dev")
+              args = ap.parse_args()
+
+              pois, locs, countries = defaultdict(list), [], {}
+              for path in args.inputs:
+                  with open(path, encoding="utf-8") as fh:
+                      for line in fh:
+                          if not line.strip():
+                              continue
+                          row = json.loads(line)
+                          if row["t"] == "poi":
+                              pois[row["cc"]].append(row)
+                          elif row["t"] == "loc":
+                              locs.append(row)
+                          elif row["t"] == "country":
+                              countries[row["cc"]] = row
+
+              if os.path.exists(args.out):
+                  os.remove(args.out)
+              db = ps.create(args.out, {"id": "world", "cc": "", "title": "World landmarks", "version": args.version,
+                                        "attribution": "(c) OpenStreetMap contributors, ODbL 1.0"})
+              total = 0
+              for cc, rows in pois.items():
+                  rows.sort(key=lambda r: -r["rank"])
+                  for r in rows[: args.per_country]:
+                      ps.insert_place(db, r["lat"], r["lon"], r["kind"], r["rank"], r["name"], r.get("names", {}), cc,
+                                      langs=ps.WORLD_LANGS)
+                      total += 1
+              for r in locs:
+                  ps.insert_locality(db, r["lat"], r["lon"], r["kind"], r["name"], r.get("names", {}), r.get("pop"), r["cc"],
+                                     langs=ps.WORLD_LANGS)
+              for cc, r in countries.items():
+                  ps.insert_country(db, cc, r["name"], r.get("names", {}), langs=ps.WORLD_LANGS)
+              ps.finish(db)
+              print(f"world: {total} landmarks, {len(locs)} localities, {len(countries)} countries -> {args.out}",
+                    file=sys.stderr)
+
+
+          if __name__ == "__main__":
+              main()
+          NOOK_SCRIPT_EOF
+          cat > tool/geo/plan_regions.py <<'NOOK_SCRIPT_EOF'
+          #!/usr/bin/env python3
+          """Turn Geofabrik's region index into the geo-packs build matrix.
+
+              python3 tool/geo/plan_regions.py index-v1-nogeom.json [--only thailand,japan]
+
+          Prints {"a": [...], "b": [...]} — two batches, because a GitHub Actions
+          matrix holds at most 256 jobs. One pack per country; the United States is
+          split into states (one country extract would be ~11 GB).
+          """
+          import argparse
+          import json
+
+          SPLIT_INTO_CHILDREN = {"us"}
+          # Geofabrik publishes both; keep the one that matches the country users expect.
+          SKIP = {"great-britain"}
+
+
+          def plan(index: dict, only: set[str] | None) -> list[dict]:
+              features = [f["properties"] for f in index["features"]]
+              out, seen = [], set()
+              for p in features:
+                  rid = p["id"]
+                  iso = p.get("iso3166-1:alpha2") or []
+                  parent = p.get("parent")
+                  is_state_of_split = parent in SPLIT_INTO_CHILDREN
+                  if rid in SPLIT_INTO_CHILDREN or rid in SKIP:
+                      continue
+                  if not iso and not is_state_of_split:
+                      continue
+                  if iso and parent and any(f.get("id") == parent and f.get("iso3166-1:alpha2") for f in features):
+                      continue  # a sub-region of a country we already build whole
+                  pack_id = f"{parent}-{rid}" if is_state_of_split else rid
+                  pack_id = pack_id.replace("/", "-").lower()
+                  if pack_id in seen or (only and rid not in only and pack_id not in only):
+                      continue
+                  seen.add(pack_id)
+                  out.append({
+                      "id": pack_id,
+                      "title": f"United States — {p['name']}" if is_state_of_split else p["name"],
+                      "cc": "US" if is_state_of_split else ",".join(iso),
+                      "url": p["urls"]["pbf"],
+                  })
+              return sorted(out, key=lambda r: r["id"])
+
+
+          def main() -> None:
+              ap = argparse.ArgumentParser()
+              ap.add_argument("index")
+              ap.add_argument("--only", default="")
+              args = ap.parse_args()
+              with open(args.index, encoding="utf-8") as fh:
+                  regions = plan(json.load(fh), {s.strip() for s in args.only.split(",") if s.strip()} or None)
+              half = (len(regions) + 1) // 2
+              print(json.dumps({"a": regions[:half], "b": regions[half:] or [], "count": len(regions)}))
+
+
+          if __name__ == "__main__":
+              main()
+          NOOK_SCRIPT_EOF
+          cat > tool/geo/make_catalog.py <<'NOOK_SCRIPT_EOF'
+          #!/usr/bin/env python3
+          """Combine per-pack metadata files into the catalog.json the app reads.
+
+              python3 tool/geo/make_catalog.py meta/*.meta.json --version geo-123 > catalog.json
+          """
+          import argparse
+          import json
+
+
+          def main() -> None:
+              ap = argparse.ArgumentParser()
+              ap.add_argument("metas", nargs="+")
+              ap.add_argument("--version", required=True)
+              args = ap.parse_args()
+              packs = []
+              for path in args.metas:
+                  with open(path, encoding="utf-8") as fh:
+                      packs.append(json.load(fh))
+              packs.sort(key=lambda p: p["title"])
+              print(json.dumps({"format": 1, "version": args.version, "packs": packs}, ensure_ascii=False, indent=1))
+
+
+          if __name__ == "__main__":
+              main()
+          NOOK_SCRIPT_EOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: geo-tools
+          path: tool/geo
+          retention-days: 2
+      - id: plan
+        run: |
+          curl -fsSL --retry 5 -o index.json https://download.geofabrik.de/index-v1-nogeom.json
+          python3 tool/geo/plan_regions.py index.json --only "${{ inputs.only }}" > plan.json
+          echo "Regions: $(jq .count plan.json)"
+          echo "a=$(jq -c .a plan.json)" >> "$GITHUB_OUTPUT"
+          echo "b=$(jq -c .b plan.json)" >> "$GITHUB_OUTPUT"
+      - name: Create draft release
+        run: |
+          gh release create "$TAG" --repo "$TARGET_REPO" --draft \
+            --title "NooK place packs $(date -u +%Y-%m-%d)" \
+            --notes "Offline place data for NooK. Map data (c) OpenStreetMap contributors, ODbL 1.0."
+
+  build-a:
+    needs: plan
+    if: needs.plan.outputs.a != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        region: ${{ fromJSON(needs.plan.outputs.a) }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: geo-tools
+          path: tool/geo
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq osmium-tool && pip install -q osmium shapely
+      - name: Build ${{ matrix.region.id }}
+        env:
+          ID: ${{ matrix.region.id }}
+          TITLE: ${{ matrix.region.title }}
+          CC: ${{ matrix.region.cc }}
+          URL: ${{ matrix.region.url }}
+        run: |
+          set -euo pipefail
+          curl -fL --retry 5 --retry-delay 10 -o in.osm.pbf "$URL"
+          # Keep only what the pack uses: a few % of the extract.
+          osmium tags-filter in.osm.pbf $(python3 tool/geo/build_pack.py --print-filters) -o filtered.osm.pbf --overwrite
+          rm in.osm.pbf
+          python3 tool/geo/build_pack.py filtered.osm.pbf --id "$ID" --cc "$CC" --title "$TITLE" \
+            --version "$TAG" --out "$ID.sqlite" --landmarks "$ID.landmarks.jsonl"
+          gzip -9 "$ID.sqlite" "$ID.landmarks.jsonl"
+          python3 - <<'PY'
+          import hashlib, json, os
+          pid = os.environ["ID"]
+          f = pid + ".sqlite.gz"
+          meta = {"id": pid, "title": os.environ["TITLE"], "file": f, "bytes": os.path.getsize(f),
+                  "sha256": hashlib.sha256(open(f, "rb").read()).hexdigest(), "version": os.environ["TAG"],
+                  "cc": os.environ["CC"].split(",")[0]}
+          json.dump(meta, open(pid + ".meta.json", "w"), ensure_ascii=False)
+          PY
+          gh release upload "$TAG" "$ID.sqlite.gz" "$ID.landmarks.jsonl.gz" "$ID.meta.json" \
+            --repo "$TARGET_REPO" --clobber
+
+  build-b:
+    needs: plan
+    if: needs.plan.outputs.b != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        region: ${{ fromJSON(needs.plan.outputs.b) }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: geo-tools
+          path: tool/geo
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq osmium-tool && pip install -q osmium shapely
+      - name: Build ${{ matrix.region.id }}
+        env:
+          ID: ${{ matrix.region.id }}
+          TITLE: ${{ matrix.region.title }}
+          CC: ${{ matrix.region.cc }}
+          URL: ${{ matrix.region.url }}
+        run: |
+          set -euo pipefail
+          curl -fL --retry 5 --retry-delay 10 -o in.osm.pbf "$URL"
+          # Keep only what the pack uses: a few % of the extract.
+          osmium tags-filter in.osm.pbf $(python3 tool/geo/build_pack.py --print-filters) -o filtered.osm.pbf --overwrite
+          rm in.osm.pbf
+          python3 tool/geo/build_pack.py filtered.osm.pbf --id "$ID" --cc "$CC" --title "$TITLE" \
+            --version "$TAG" --out "$ID.sqlite" --landmarks "$ID.landmarks.jsonl"
+          gzip -9 "$ID.sqlite" "$ID.landmarks.jsonl"
+          python3 - <<'PY'
+          import hashlib, json, os
+          pid = os.environ["ID"]
+          f = pid + ".sqlite.gz"
+          meta = {"id": pid, "title": os.environ["TITLE"], "file": f, "bytes": os.path.getsize(f),
+                  "sha256": hashlib.sha256(open(f, "rb").read()).hexdigest(), "version": os.environ["TAG"],
+                  "cc": os.environ["CC"].split(",")[0]}
+          json.dump(meta, open(pid + ".meta.json", "w"), ensure_ascii=False)
+          PY
+          gh release upload "$TAG" "$ID.sqlite.gz" "$ID.landmarks.jsonl.gz" "$ID.meta.json" \
+            --repo "$TARGET_REPO" --clobber
+  publish:
+    needs: [plan, build-a, build-b]
+    # Publish whatever succeeded; one failed country must not block the world.
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: geo-tools
+          path: tool/geo
+      - run: pip install -q osmium
+      - name: Merge world pack and catalog
+        run: |
+          mkdir -p in
+          gh release download "$TAG" --repo "$TARGET_REPO" -D in \
+            --pattern '*.meta.json' --pattern '*.landmarks.jsonl.gz'
+          gunzip in/*.landmarks.jsonl.gz
+          python3 tool/geo/merge_world.py in/*.landmarks.jsonl --out world.sqlite --version "$TAG"
+          python3 tool/geo/make_catalog.py in/*.meta.json --version "$TAG" > catalog.json
+          echo "Packs in catalog: $(jq '.packs | length' catalog.json)"
+          ls -la world.sqlite
+      - name: Publish release
+        run: |
+          gh release upload "$TAG" world.sqlite catalog.json --repo "$TARGET_REPO" --clobber
+          gh release edit "$TAG" --repo "$TARGET_REPO" --draft=false --latest
