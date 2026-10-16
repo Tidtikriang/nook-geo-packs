@@ -513,6 +513,21 @@ jobs:
           SKIP = {"great-britain"}
 
 
+          def _matches(only: set[str] | None, rid: str, pack_id: str, name: str, iso: list[str]) -> bool:
+              """`--only` accepts Geofabrik ids, pack ids, English names or ISO codes,
+              in any letter case: thailand, Thailand, TH, us-california, California."""
+              if not only:
+                  return True
+              keys = {rid, pack_id, name, *iso}
+              return any(k.lower() in only for k in keys if k)
+
+
+          def parse_only(raw: str) -> set[str] | None:
+              picked = {s.strip().strip('"\'').lower() for s in raw.split(",")}
+              picked.discard("")
+              return picked or None
+
+
           def plan(index: dict, only: set[str] | None) -> list[dict]:
               features = [f["properties"] for f in index["features"]]
               out, seen = [], set()
@@ -529,7 +544,7 @@ jobs:
                       continue  # a sub-region of a country we already build whole
                   pack_id = f"{parent}-{rid}" if is_state_of_split else rid
                   pack_id = pack_id.replace("/", "-").lower()
-                  if pack_id in seen or (only and rid not in only and pack_id not in only):
+                  if pack_id in seen or not _matches(only, rid, pack_id, p["name"], iso):
                       continue
                   seen.add(pack_id)
                   out.append({
@@ -546,8 +561,12 @@ jobs:
               ap.add_argument("index")
               ap.add_argument("--only", default="")
               args = ap.parse_args()
+              only = parse_only(args.only)
               with open(args.index, encoding="utf-8") as fh:
-                  regions = plan(json.load(fh), {s.strip() for s in args.only.split(",") if s.strip()} or None)
+                  regions = plan(json.load(fh), only)
+              if not regions:
+                  raise SystemExit(f"No Geofabrik region matched --only {args.only!r}. "
+                                   "Use names like 'thailand', 'Japan' or ISO codes like 'TH'.")
               half = (len(regions) + 1) // 2
               print(json.dumps({"a": regions[:half], "b": regions[half:] or [], "count": len(regions)}))
 
@@ -589,8 +608,9 @@ jobs:
       - id: plan
         run: |
           curl -fsSL --retry 5 -o index.json https://download.geofabrik.de/index-v1-nogeom.json
-          python3 tool/geo/plan_regions.py index.json --only "${{ inputs.only }}" > plan.json
-          echo "Regions: $(jq .count plan.json)"
+          python3 tool/geo/plan_regions.py index.json --only "${{ inputs.only }}" > plan.json             || { echo "::error::No region matched '${{ inputs.only }}'. Use e.g. thailand, Japan or TH."; exit 1; }
+          # Notices are visible on the run page without signing in.
+          echo "::notice::Regions ($(jq .count plan.json)): $(jq -r '[.a[], .b[]] | map(.id) | join(", ")' plan.json | cut -c1-900)"
           echo "a=$(jq -c .a plan.json)" >> "$GITHUB_OUTPUT"
           echo "b=$(jq -c .b plan.json)" >> "$GITHUB_OUTPUT"
       - name: Create draft release
@@ -623,12 +643,14 @@ jobs:
           URL: ${{ matrix.region.url }}
         run: |
           set -euo pipefail
+          exec > >(tee -a build.log) 2>&1
           curl -fL --retry 5 --retry-delay 10 -o in.osm.pbf "$URL"
           # Keep only what the pack uses: a few % of the extract.
           osmium tags-filter in.osm.pbf $(python3 tool/geo/build_pack.py --print-filters) -o filtered.osm.pbf --overwrite
           rm in.osm.pbf
           python3 tool/geo/build_pack.py filtered.osm.pbf --id "$ID" --cc "$CC" --title "$TITLE" \
             --version "$TAG" --out "$ID.sqlite" --landmarks "$ID.landmarks.jsonl"
+          echo "::notice::$(tail -n 1 build.log)"
           gzip -9 "$ID.sqlite" "$ID.landmarks.jsonl"
           python3 - <<'PY'
           import hashlib, json, os
@@ -641,6 +663,12 @@ jobs:
           PY
           gh release upload "$TAG" "$ID.sqlite.gz" "$ID.landmarks.jsonl.gz" "$ID.meta.json" \
             --repo "$TARGET_REPO" --clobber
+      - name: Report failure
+        if: failure()
+        run: |
+          # Annotations stay readable on the public run page.
+          [ -f build.log ] && tail -n 15 build.log | sed 's/%/%25/g' | while IFS= read -r l; do echo "::error::$l"; done
+          df -h / | tail -n 1 | sed 's/^/::error::disk /'
 
   build-b:
     needs: plan
@@ -666,12 +694,14 @@ jobs:
           URL: ${{ matrix.region.url }}
         run: |
           set -euo pipefail
+          exec > >(tee -a build.log) 2>&1
           curl -fL --retry 5 --retry-delay 10 -o in.osm.pbf "$URL"
           # Keep only what the pack uses: a few % of the extract.
           osmium tags-filter in.osm.pbf $(python3 tool/geo/build_pack.py --print-filters) -o filtered.osm.pbf --overwrite
           rm in.osm.pbf
           python3 tool/geo/build_pack.py filtered.osm.pbf --id "$ID" --cc "$CC" --title "$TITLE" \
             --version "$TAG" --out "$ID.sqlite" --landmarks "$ID.landmarks.jsonl"
+          echo "::notice::$(tail -n 1 build.log)"
           gzip -9 "$ID.sqlite" "$ID.landmarks.jsonl"
           python3 - <<'PY'
           import hashlib, json, os
@@ -684,6 +714,12 @@ jobs:
           PY
           gh release upload "$TAG" "$ID.sqlite.gz" "$ID.landmarks.jsonl.gz" "$ID.meta.json" \
             --repo "$TARGET_REPO" --clobber
+      - name: Report failure
+        if: failure()
+        run: |
+          # Annotations stay readable on the public run page.
+          [ -f build.log ] && tail -n 15 build.log | sed 's/%/%25/g' | while IFS= read -r l; do echo "::error::$l"; done
+          df -h / | tail -n 1 | sed 's/^/::error::disk /'
   publish:
     needs: [plan, build-a, build-b]
     # Publish whatever succeeded; one failed country must not block the world.
@@ -699,11 +735,12 @@ jobs:
         run: |
           mkdir -p in
           gh release download "$TAG" --repo "$TARGET_REPO" -D in \
-            --pattern '*.meta.json' --pattern '*.landmarks.jsonl.gz'
+            --pattern '*.meta.json' --pattern '*.landmarks.jsonl.gz' \
+            || { echo "::error::No country pack was built; see the build jobs above."; exit 1; }
           gunzip in/*.landmarks.jsonl.gz
           python3 tool/geo/merge_world.py in/*.landmarks.jsonl --out world.sqlite --version "$TAG"
           python3 tool/geo/make_catalog.py in/*.meta.json --version "$TAG" > catalog.json
-          echo "Packs in catalog: $(jq '.packs | length' catalog.json)"
+          echo "::notice::Published $(jq '.packs | length' catalog.json) packs; world.sqlite $(du -h world.sqlite | cut -f1)"
           ls -la world.sqlite
       - name: Publish release
         run: |
