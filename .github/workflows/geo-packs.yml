@@ -5,15 +5,16 @@ name: geo-packs
 # build scripts are embedded below (generated from tool/geo in the NooK app
 # repository by make_standalone_workflow.py). No secrets or settings needed.
 #
-# Actions -> geo-packs -> Run workflow. Leave "only" empty for every country,
-# or enter Geofabrik ids such as "thailand" for a quick run.
+# Actions -> geo-packs -> Run workflow. Leave "only" empty to rebuild every
+# country as a new release. Enter names or codes ("thailand", "US", "Japan,
+# FR") to build just those into the current release; other packs stay.
 #
 # Map data (c) OpenStreetMap contributors, ODbL 1.0.
 on:
   workflow_dispatch:
     inputs:
       only:
-        description: 'Optional comma-separated Geofabrik ids (empty = every country)'
+        description: 'Countries to add/rebuild in the current release, e.g. US or thailand,japan (empty = whole world, new release)'
         required: false
         default: ''
 
@@ -23,7 +24,6 @@ permissions:
 env:
   GH_TOKEN: ${{ github.token }}
   TARGET_REPO: ${{ github.repository }}
-  TAG: geo-${{ github.run_id }}
 
 jobs:
   plan:
@@ -31,6 +31,7 @@ jobs:
     outputs:
       a: ${{ steps.plan.outputs.a }}
       b: ${{ steps.plan.outputs.b }}
+      tag: ${{ steps.release.outputs.tag }}
     steps:
       - name: Write build scripts
         run: |
@@ -504,7 +505,11 @@ jobs:
           Prints {"a": [...], "b": [...]} — two batches, because a GitHub Actions
           matrix holds at most 256 jobs. One pack per country; the United States is
           split into states (one country extract would be ~11 GB).
+
+          US states are recognised by their single ISO 3166-2 code (US-CA, US-NY...),
+          not by where Geofabrik nests them in the index, which has changed over time.
           """
+          import re
           import argparse
           import json
 
@@ -513,12 +518,12 @@ jobs:
           SKIP = {"great-britain"}
 
 
-          def _matches(only: set[str] | None, rid: str, pack_id: str, name: str, iso: list[str]) -> bool:
+          def _matches(only: set[str] | None, keys: list[str]) -> bool:
               """`--only` accepts Geofabrik ids, pack ids, English names or ISO codes,
-              in any letter case: thailand, Thailand, TH, us-california, California."""
+              in any letter case: thailand, Thailand, TH, us-california, California,
+              US-CA, or US for every state."""
               if not only:
                   return True
-              keys = {rid, pack_id, name, *iso}
               return any(k.lower() in only for k in keys if k)
 
 
@@ -528,31 +533,43 @@ jobs:
               return picked or None
 
 
+          def us_state_code(p: dict) -> str | None:
+              """'US-CA' for a single-state region; None for countries and for
+              multi-state groupings such as us-west."""
+              codes = [c for c in (p.get("iso3166-2") or []) if c.startswith("US-")]
+              return codes[0] if len(codes) == 1 else None
+
+
+          def _slug(name: str) -> str:
+              return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+
+
           def plan(index: dict, only: set[str] | None) -> list[dict]:
               features = [f["properties"] for f in index["features"]]
+              by_id = {f["id"]: f for f in features}
               out, seen = [], set()
               for p in features:
                   rid = p["id"]
                   iso = p.get("iso3166-1:alpha2") or []
                   parent = p.get("parent")
-                  is_state_of_split = parent in SPLIT_INTO_CHILDREN
+                  # Territories with their own country code (Puerto Rico = PR) stay countries.
+                  state = None if iso else us_state_code(p)
                   if rid in SPLIT_INTO_CHILDREN or rid in SKIP:
                       continue
-                  if not iso and not is_state_of_split:
-                      continue
-                  if iso and parent and any(f.get("id") == parent and f.get("iso3166-1:alpha2") for f in features):
-                      continue  # a sub-region of a country we already build whole
-                  pack_id = f"{parent}-{rid}" if is_state_of_split else rid
-                  pack_id = pack_id.replace("/", "-").lower()
-                  if pack_id in seen or not _matches(only, rid, pack_id, p["name"], iso):
+                  if state:
+                      pack_id, title, cc = f"us-{_slug(p['name'])}", f"United States — {p['name']}", "US"
+                      keys = [rid, pack_id, p["name"], state, "US", "united states"]
+                  else:
+                      if not iso:
+                          continue
+                      if parent and parent not in SPLIT_INTO_CHILDREN and by_id.get(parent, {}).get("iso3166-1:alpha2"):
+                          continue  # a sub-region of a country we already build whole
+                      pack_id, title, cc = rid.replace("/", "-").lower(), p["name"], ",".join(iso)
+                      keys = [rid, pack_id, p["name"], *iso]
+                  if pack_id in seen or not _matches(only, keys):
                       continue
                   seen.add(pack_id)
-                  out.append({
-                      "id": pack_id,
-                      "title": f"United States — {p['name']}" if is_state_of_split else p["name"],
-                      "cc": "US" if is_state_of_split else ",".join(iso),
-                      "url": p["urls"]["pbf"],
-                  })
+                  out.append({"id": pack_id, "title": title, "cc": cc, "url": p["urls"]["pbf"]})
               return sorted(out, key=lambda r: r["id"])
 
 
@@ -613,17 +630,28 @@ jobs:
           echo "::notice::Regions ($(jq .count plan.json)): $(jq -r '[.a[], .b[]] | map(.id) | join(", ")' plan.json | cut -c1-900)"
           echo "a=$(jq -c .a plan.json)" >> "$GITHUB_OUTPUT"
           echo "b=$(jq -c .b plan.json)" >> "$GITHUB_OUTPUT"
-      - name: Create draft release
+      # A partial run adds to the current release; a full run starts a new one.
+      - id: release
+        name: Choose release
         run: |
-          gh release create "$TAG" --repo "$TARGET_REPO" --draft \
-            --title "NooK place packs $(date -u +%Y-%m-%d)" \
-            --notes "Offline place data for NooK. Map data (c) OpenStreetMap contributors, ODbL 1.0."
+          if [ -n "${{ inputs.only }}" ] && latest=$(gh release view --repo "$TARGET_REPO" --json tagName -q .tagName 2>/dev/null); then
+            echo "::notice::Adding to the current release $latest"
+            echo "tag=$latest" >> "$GITHUB_OUTPUT"
+          else
+            tag="geo-${{ github.run_id }}"
+            gh release create "$tag" --repo "$TARGET_REPO" --draft \
+              --title "NooK place packs $(date -u +%Y-%m-%d)" \
+              --notes "Offline place data for NooK. Map data (c) OpenStreetMap contributors, ODbL 1.0."
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          fi
 
   build-a:
     needs: plan
     if: needs.plan.outputs.a != '[]'
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
     strategy:
       fail-fast: false
       max-parallel: 20
@@ -675,6 +703,8 @@ jobs:
     if: needs.plan.outputs.b != '[]'
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
     strategy:
       fail-fast: false
       max-parallel: 20
@@ -725,6 +755,8 @@ jobs:
     # Publish whatever succeeded; one failed country must not block the world.
     if: always() && needs.plan.result == 'success'
     runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
     steps:
       - uses: actions/download-artifact@v4
         with:
