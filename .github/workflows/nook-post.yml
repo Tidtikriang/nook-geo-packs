@@ -1,0 +1,896 @@
+name: nook-post
+
+# NooK Post: the content-blind mailbox for the NooK app. Generated from
+# relay/ in the app repository by make_standalone_workflow.py; the relay's
+# whole source is embedded below.
+#
+# One-time setup in THIS repository (Settings > Secrets and variables >
+# Actions > New repository secret):
+#   CLOUDFLARE_API_TOKEN   Cloudflare token, template "Edit Cloudflare Workers"
+#   CLOUDFLARE_ACCOUNT_ID  Cloudflare dashboard > Workers & Pages > Account ID
+#   FCM_SERVICE_ACCOUNT    optional, Firebase service-account JSON (wake-ups)
+# Then: Actions > nook-post > Run workflow.
+on:
+  workflow_dispatch:
+  push:
+    paths: ['.github/workflows/nook-post.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      FCM_SERVICE_ACCOUNT: ${{ secrets.FCM_SERVICE_ACCOUNT }}
+    defaults:
+      run:
+        working-directory: relay
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Write NooK Post source
+        working-directory: .
+        run: |
+          mkdir -p relay/src relay/test
+          cat > relay/wrangler.toml <<'NOOK_RELAY_EOF'
+          name = "nook-post"
+          main = "src/index.js"
+          compatibility_date = "2025-09-01"
+          workers_dev = true
+
+          # NooK Post keeps no logs: no request logs, no IPs, no traces.
+          logpush = false
+          [observability]
+          enabled = false
+
+          [[durable_objects.bindings]]
+          name = "MAILBOX"
+          class_name = "Mailbox"
+
+          [[migrations]]
+          tag = "v1"
+          new_sqlite_classes = ["Mailbox"]
+
+          [vars]
+          # Space- or comma-separated Ed25519 keys (base64url) removed from NooK Post
+          # after a confirmed report. Their deposits and collections are refused.
+          BANNED_KEYS = ""
+
+          # Secret (set with `wrangler secret put FCM_SERVICE_ACCOUNT` or by CI):
+          #   FCM_SERVICE_ACCOUNT  Firebase service-account JSON, enables wake-ups.
+          NOOK_RELAY_EOF
+          cat > relay/src/core.js <<'NOOK_RELAY_EOF'
+          // NooK Post: a content-blind mailbox for sealed envelopes.
+          //
+          // What the relay can see: which NooK key sent an envelope to which NooK key,
+          // its size and when. What it cannot see: anything inside. Envelopes are
+          // already end-to-end sealed on the phone (X25519 + AES-256-GCM, signed with
+          // Ed25519); the relay stores the opaque text until the recipient collects
+          // and acknowledges it, then deletes it. Nothing is kept longer than 30 days.
+          // No accounts, no names, no phone numbers, no IP logs.
+
+          export const MAX_ENVELOPE_CHARS = 25 * 1024 * 1024;
+          export const MAILBOX_QUOTA_CHARS = 200 * 1024 * 1024;
+          export const MAILBOX_MAX_ITEMS = 2000;
+          export const SENDER_HOURLY_LIMIT = 300;
+          export const RETENTION_MS = 30 * 24 * 3600 * 1000;
+          export const CLOCK_SKEW_MS = 5 * 60 * 1000;
+          export const PUSH_QUIET_MS = 2 * 60 * 1000;
+          export const FETCH_MAX_CHARS = 8 * 1024 * 1024;
+          export const CHUNK_CHARS = 1_000_000; // Durable Object SQLite rows max out at 2 MB
+
+          export class HttpError extends Error {
+            constructor(status, message) {
+              super(message);
+              this.status = status;
+            }
+          }
+
+          const enc = new TextEncoder();
+
+          export function b64urlDecode(s) {
+            if (typeof s !== 'string' || !/^[A-Za-z0-9_-]*={0,2}$/.test(s)) throw new HttpError(400, 'bad base64');
+            const b64 = s.replace(/-/g, '+').replace(/_/g, '/');
+            const bin = atob(b64 + '='.repeat((4 - (b64.length % 4)) % 4));
+            return Uint8Array.from(bin, (c) => c.charCodeAt(0));
+          }
+
+          export function b64urlEncode(bytes) {
+            let bin = '';
+            for (const b of bytes) bin += String.fromCharCode(b);
+            return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_');
+          }
+
+          export async function sha256Hex(text) {
+            const digest = await crypto.subtle.digest('SHA-256', typeof text === 'string' ? enc.encode(text) : text);
+            return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+          }
+
+          /// Canonical form of a mailbox key: unpadded base64url of 32 Ed25519 bytes.
+          export function normalizeKey(s) {
+            const bytes = b64urlDecode(s);
+            if (bytes.length !== 32) throw new HttpError(400, 'bad key');
+            return b64urlEncode(bytes).replace(/=+$/, '');
+          }
+
+          /// The Ed25519 half of a `nook1:` identity (base64url of ed25519 || x25519).
+          export function signingKeyOf(identity) {
+            if (typeof identity !== 'string' || !identity.startsWith('nook1:')) throw new HttpError(400, 'bad identity');
+            const bytes = b64urlDecode(identity.slice(6));
+            if (bytes.length !== 64) throw new HttpError(400, 'bad identity');
+            return b64urlEncode(bytes.slice(0, 32)).replace(/=+$/, '');
+          }
+
+          export function signingString(method, pathAndQuery, time, bodyHash) {
+            return `NOOK-POST-1\n${method.toUpperCase()}\n${pathAndQuery}\n${time}\n${bodyHash}`;
+          }
+
+          /// Checks the Ed25519 request signature and returns the caller's key.
+          /// Headers: x-nook-key, x-nook-time (ms since epoch), x-nook-sig.
+          export async function verifyRequest({ method, pathAndQuery, headers, body, now }) {
+            const key = headers.get('x-nook-key');
+            const time = headers.get('x-nook-time');
+            const sig = headers.get('x-nook-sig');
+            if (!key || !time || !sig) throw new HttpError(401, 'unsigned');
+            const t = Number(time);
+            if (!Number.isFinite(t) || Math.abs(now - t) > CLOCK_SKEW_MS) throw new HttpError(401, 'stale');
+            const normalized = normalizeKey(key);
+            const publicKey = await crypto.subtle.importKey('raw', b64urlDecode(normalized), { name: 'Ed25519' }, false, [
+              'verify',
+            ]);
+            const message = signingString(method, pathAndQuery, time, await sha256Hex(body ?? ''));
+            const ok = await crypto.subtle.verify({ name: 'Ed25519' }, publicKey, b64urlDecode(sig), enc.encode(message));
+            if (!ok) throw new HttpError(401, 'bad signature');
+            return normalized;
+          }
+
+          /// In-memory storage, same contract as the Durable Object's SQL store.
+          export class MemoryStore {
+            constructor() {
+              this.items = new Map();
+              this.meta = new Map();
+            }
+            has(id) {
+              return this.items.has(id);
+            }
+            insert(id, from, at, text) {
+              this.items.set(id, { id, from, at, text });
+            }
+            totals() {
+              let bytes = 0;
+              for (const i of this.items.values()) bytes += i.text.length;
+              return { count: this.items.size, bytes };
+            }
+            countFromSince(from, since) {
+              let n = 0;
+              for (const i of this.items.values()) if (i.from === from && i.at >= since) n++;
+              return n;
+            }
+            list(limit) {
+              return [...this.items.values()]
+                .sort((a, b) => a.at - b.at || (a.id < b.id ? -1 : 1))
+                .slice(0, limit)
+                .map(({ id, at, text }) => ({ id, at, size: text.length }));
+            }
+            read(id) {
+              return this.items.get(id)?.text ?? null;
+            }
+            delete(id) {
+              this.items.delete(id);
+            }
+            deleteOlderThan(cutoff) {
+              for (const [id, i] of this.items) if (i.at < cutoff) this.items.delete(id);
+            }
+            oldest() {
+              let min = null;
+              for (const i of this.items.values()) if (min === null || i.at < min) min = i.at;
+              return min;
+            }
+            getMeta(k) {
+              return this.meta.get(k) ?? null;
+            }
+            setMeta(k, v) {
+              if (v === null) this.meta.delete(k);
+              else this.meta.set(k, v);
+            }
+          }
+
+          /// Durable Object SQLite storage. Large envelopes are split into chunks.
+          export class SqlStore {
+            constructor(sql) {
+              this.sql = sql;
+              sql.exec(`CREATE TABLE IF NOT EXISTS envelopes (id TEXT PRIMARY KEY, sender TEXT NOT NULL, at INTEGER NOT NULL, size INTEGER NOT NULL)`);
+              sql.exec(`CREATE TABLE IF NOT EXISTS chunks (id TEXT NOT NULL, n INTEGER NOT NULL, part TEXT NOT NULL, PRIMARY KEY (id, n))`);
+              sql.exec(`CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)`);
+              sql.exec(`CREATE INDEX IF NOT EXISTS envelopes_at ON envelopes(at)`);
+            }
+            has(id) {
+              return this.sql.exec('SELECT 1 FROM envelopes WHERE id = ?', id).toArray().length > 0;
+            }
+            insert(id, from, at, text) {
+              this.sql.exec('INSERT INTO envelopes (id, sender, at, size) VALUES (?, ?, ?, ?)', id, from, at, text.length);
+              for (let n = 0, i = 0; i < text.length || n === 0; n++, i += CHUNK_CHARS) {
+                this.sql.exec('INSERT INTO chunks (id, n, part) VALUES (?, ?, ?)', id, n, text.slice(i, i + CHUNK_CHARS));
+              }
+            }
+            totals() {
+              const r = this.sql.exec('SELECT COUNT(*) AS c, COALESCE(SUM(size), 0) AS b FROM envelopes').one();
+              return { count: r.c, bytes: r.b };
+            }
+            countFromSince(from, since) {
+              return this.sql.exec('SELECT COUNT(*) AS c FROM envelopes WHERE sender = ? AND at >= ?', from, since).one().c;
+            }
+            list(limit) {
+              return this.sql.exec('SELECT id, at, size FROM envelopes ORDER BY at, id LIMIT ?', limit).toArray();
+            }
+            read(id) {
+              const parts = this.sql.exec('SELECT part FROM chunks WHERE id = ? ORDER BY n', id).toArray();
+              return parts.length ? parts.map((p) => p.part).join('') : null;
+            }
+            delete(id) {
+              this.sql.exec('DELETE FROM chunks WHERE id = ?', id);
+              this.sql.exec('DELETE FROM envelopes WHERE id = ?', id);
+            }
+            deleteOlderThan(cutoff) {
+              this.sql.exec('DELETE FROM chunks WHERE id IN (SELECT id FROM envelopes WHERE at < ?)', cutoff);
+              this.sql.exec('DELETE FROM envelopes WHERE at < ?', cutoff);
+            }
+            oldest() {
+              return this.sql.exec('SELECT MIN(at) AS m FROM envelopes').one().m ?? null;
+            }
+            getMeta(k) {
+              return this.sql.exec('SELECT v FROM meta WHERE k = ?', k).toArray()[0]?.v ?? null;
+            }
+            setMeta(k, v) {
+              if (v === null) this.sql.exec('DELETE FROM meta WHERE k = ?', k);
+              else this.sql.exec('INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)', k, v);
+            }
+          }
+
+          /// One recipient's mailbox. In production each mailbox is its own Durable
+          /// Object, so these methods are its RPC surface.
+          export class MailboxLogic {
+            constructor(store) {
+              this.store = store;
+            }
+
+            /// Returns { stored, error?, push } where push is the device token to wake, if any.
+            deposit(id, from, text, now) {
+              const s = this.store;
+              s.deleteOlderThan(now - RETENTION_MS);
+              if (s.has(id)) return { stored: false, duplicate: true, push: null };
+              // Errors are returned, not thrown: they must survive Durable Object RPC.
+              if (s.countFromSince(from, now - 3600_000) >= SENDER_HOURLY_LIMIT) return { stored: false, error: 429, push: null };
+              const { count, bytes } = s.totals();
+              if (count >= MAILBOX_MAX_ITEMS || bytes + text.length > MAILBOX_QUOTA_CHARS) {
+                return { stored: false, error: 507, push: null };
+              }
+              s.insert(id, from, now, text);
+
+              let push = null;
+              const token = s.getMeta('push');
+              const last = s.getMeta('lastPush');
+              if (token && (last === null || now - Number(last) >= PUSH_QUIET_MS)) {
+                s.setMeta('lastPush', String(now));
+                push = token;
+              }
+              return { stored: true, duplicate: false, push };
+            }
+
+            /// Oldest first, up to [maxChars] of envelope text (always at least one).
+            collect(maxChars, now) {
+              const s = this.store;
+              s.deleteOlderThan(now - RETENTION_MS);
+              const items = [];
+              let used = 0;
+              const listed = s.list(MAILBOX_MAX_ITEMS);
+              for (const row of listed) {
+                if (items.length && used + row.size > maxChars) break;
+                const env = s.read(row.id);
+                if (env === null) continue;
+                items.push({ id: row.id, env });
+                used += row.size;
+              }
+              return { items, more: items.length < listed.length };
+            }
+
+            ack(ids) {
+              for (const id of ids) this.store.delete(id);
+              return { remaining: this.store.totals().count };
+            }
+
+            setPush(token) {
+              this.store.setMeta('push', token);
+              this.store.setMeta('lastPush', null);
+            }
+
+            /// Forgets [token] (or whatever is stored when null).
+            clearPush(token = null) {
+              if (token === null || this.store.getMeta('push') === token) this.store.setMeta('push', null);
+            }
+
+            expire(now) {
+              this.store.deleteOlderThan(now - RETENTION_MS);
+              const oldest = this.store.oldest();
+              return oldest === null ? null : oldest + RETENTION_MS;
+            }
+          }
+          NOOK_RELAY_EOF
+          cat > relay/src/router.js <<'NOOK_RELAY_EOF'
+          import {
+            FETCH_MAX_CHARS,
+            HttpError,
+            MAX_ENVELOPE_CHARS,
+            normalizeKey,
+            sha256Hex,
+            signingKeyOf,
+            verifyRequest,
+          } from './core.js';
+          import { INVITE_PAGE } from './invite_page.js';
+          import { sendPush } from './push.js';
+
+          const json = (data, status = 200) =>
+            new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json' } });
+
+          function mailbox(env, key) {
+            return env.MAILBOX.get(env.MAILBOX.idFromName(key));
+          }
+
+          function banned(env, key) {
+            return (env.BANNED_KEYS ?? '')
+              .split(/[\s,]+/)
+              .filter(Boolean)
+              .includes(key);
+          }
+
+          async function readBody(request, limit) {
+            const length = Number(request.headers.get('content-length') ?? 0);
+            if (length > limit) throw new HttpError(413, 'too large');
+            const text = await request.text();
+            if (text.length > limit) throw new HttpError(413, 'too large');
+            return text;
+          }
+
+          /// HTTP surface. Every route except /v1/health is signed by the caller's
+          /// NooK key; the relay never learns anything else about them.
+          export async function handle(request, env, ctx, now = Date.now()) {
+            try {
+              const url = new URL(request.url);
+              const pathAndQuery = url.pathname + url.search;
+              const route = `${request.method} ${url.pathname}`;
+
+              if (route === 'GET /v1/health') return new Response('ok');
+              if (route === 'GET /i') {
+                return new Response(INVITE_PAGE, {
+                  headers: {
+                    'content-type': 'text/html; charset=utf-8',
+                    'cache-control': 'public, max-age=3600',
+                    'referrer-policy': 'no-referrer',
+                    'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'",
+                  },
+                });
+              }
+
+              const limit = route === 'POST /v1/deposit' ? MAX_ENVELOPE_CHARS : 64 * 1024;
+              const body = await readBody(request, limit);
+              const caller = await verifyRequest({ method: request.method, pathAndQuery, headers: request.headers, body, now });
+              if (banned(env, caller)) throw new HttpError(403, 'not accepted');
+
+              switch (route) {
+                case 'POST /v1/deposit': {
+                  const to = normalizeKey(url.searchParams.get('to') ?? '');
+                  if (banned(env, to)) throw new HttpError(403, 'not accepted');
+                  let envelope;
+                  try {
+                    envelope = JSON.parse(body);
+                  } catch {
+                    throw new HttpError(400, 'not an envelope');
+                  }
+                  // The sealed envelope must really be from the caller and for `to`,
+                  // so nobody can fill a stranger's mailbox in someone else's name.
+                  if (signingKeyOf(envelope.from) !== caller || signingKeyOf(envelope.to) !== to) {
+                    throw new HttpError(400, 'envelope does not match');
+                  }
+                  const id = (await sha256Hex(body)).slice(0, 32);
+                  const result = await mailbox(env, to).deposit(id, caller, body, now);
+                  if (result.error) throw new HttpError(result.error, result.error === 429 ? 'slow down' : 'mailbox full');
+                  if (result.push) {
+                    const wake = sendPush(env, result.push).then(async (gone) => {
+                      if (gone) await mailbox(env, to).clearPush(result.push);
+                    });
+                    ctx?.waitUntil ? ctx.waitUntil(wake.catch(() => {})) : await wake.catch(() => {});
+                  }
+                  return json({ id, stored: result.stored }, result.stored ? 201 : 200);
+                }
+                case 'GET /v1/inbox': {
+                  const max = Math.min(Number(url.searchParams.get('max') ?? FETCH_MAX_CHARS) || FETCH_MAX_CHARS, FETCH_MAX_CHARS);
+                  return json(await mailbox(env, caller).collect(max, now));
+                }
+                case 'POST /v1/ack': {
+                  const { ids } = JSON.parse(body || '{}');
+                  if (!Array.isArray(ids) || ids.length > 500 || !ids.every((i) => typeof i === 'string')) {
+                    throw new HttpError(400, 'bad ids');
+                  }
+                  return json(await mailbox(env, caller).ack(ids));
+                }
+                case 'PUT /v1/push': {
+                  const { token } = JSON.parse(body || '{}');
+                  if (typeof token !== 'string' || token.length < 8 || token.length > 4096) throw new HttpError(400, 'bad token');
+                  await mailbox(env, caller).setPush(token);
+                  return json({ ok: true });
+                }
+                case 'DELETE /v1/push':
+                  await mailbox(env, caller).clearPush(null);
+                  return json({ ok: true });
+                default:
+                  throw new HttpError(404, 'not found');
+              }
+            } catch (e) {
+              if (e instanceof HttpError) return json({ error: e.message }, e.status);
+              if (e instanceof SyntaxError) return json({ error: 'bad json' }, 400);
+              return json({ error: 'unavailable' }, 503);
+            }
+          }
+          NOOK_RELAY_EOF
+          cat > relay/src/push.js <<'NOOK_RELAY_EOF'
+          // Content-free wake-ups through Firebase Cloud Messaging (Android, and iOS
+          // via the APNs key uploaded to Firebase). The notification carries no name,
+          // no text and no preview: only localisation keys, so each phone shows
+          // "Something is waiting for you" in its own language. Many deposits collapse
+          // into one notification.
+          //
+          // Configure with the secret FCM_SERVICE_ACCOUNT (the service-account JSON
+          // from Firebase). Without it, push is simply off and apps fetch on open.
+
+          import { b64urlEncode } from './core.js';
+
+          let cached = null; // { token, exp }
+
+          function pemToPkcs8(pem) {
+            const body = pem.replace(/-----[^-]+-----/g, '').replace(/\s+/g, '');
+            return Uint8Array.from(atob(body), (c) => c.charCodeAt(0));
+          }
+
+          const enc = new TextEncoder();
+          const b64json = (o) => b64urlEncode(enc.encode(JSON.stringify(o))).replace(/=+$/, '');
+
+          async function accessToken(sa, now) {
+            if (cached && cached.exp - 60 > now / 1000) return cached.token;
+            const iat = Math.floor(now / 1000);
+            const claims = {
+              iss: sa.client_email,
+              scope: 'https://www.googleapis.com/auth/firebase.messaging',
+              aud: 'https://oauth2.googleapis.com/token',
+              iat,
+              exp: iat + 3600,
+            };
+            const unsigned = `${b64json({ alg: 'RS256', typ: 'JWT' })}.${b64json(claims)}`;
+            const key = await crypto.subtle.importKey(
+              'pkcs8',
+              pemToPkcs8(sa.private_key),
+              { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+              false,
+              ['sign'],
+            );
+            const sig = new Uint8Array(await crypto.subtle.sign('RSASSA-PKCS1-v1_5', key, enc.encode(unsigned)));
+            const res = await fetch('https://oauth2.googleapis.com/token', {
+              method: 'POST',
+              headers: { 'content-type': 'application/x-www-form-urlencoded' },
+              body: `grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=${unsigned}.${b64urlEncode(sig).replace(/=+$/, '')}`,
+            });
+            if (!res.ok) throw new Error(`oauth ${res.status}`);
+            const { access_token, expires_in } = await res.json();
+            cached = { token: access_token, exp: iat + (expires_in ?? 3600) };
+            return access_token;
+          }
+
+          /// The wake-up message. Exported so tests can check it carries no content.
+          export function wakeMessage(token) {
+            return {
+              message: {
+                token,
+                data: { nook: 'mail' },
+                android: {
+                  priority: 'normal',
+                  collapse_key: 'nook',
+                  notification: { title_loc_key: 'nook_push_title', body_loc_key: 'nook_push_body', tag: 'nook' },
+                },
+                apns: {
+                  headers: { 'apns-priority': '5', 'apns-collapse-id': 'nook' },
+                  payload: { aps: { alert: { 'title-loc-key': 'NOOK_PUSH_TITLE', 'loc-key': 'NOOK_PUSH_BODY' }, 'thread-id': 'nook' } },
+                },
+              },
+            };
+          }
+
+          /// Sends one wake-up. Resolves true when the token is no longer valid.
+          export async function sendPush(env, token, now = Date.now()) {
+            if (!env.FCM_SERVICE_ACCOUNT) return false;
+            const sa = JSON.parse(env.FCM_SERVICE_ACCOUNT);
+            const res = await fetch(`https://fcm.googleapis.com/v1/projects/${sa.project_id}/messages:send`, {
+              method: 'POST',
+              headers: { authorization: `Bearer ${await accessToken(sa, now)}`, 'content-type': 'application/json' },
+              body: JSON.stringify(wakeMessage(token)),
+            });
+            if (res.status === 404 || res.status === 400) {
+              const text = await res.text();
+              return /UNREGISTERED|INVALID_ARGUMENT|registration-token-not-registered/.test(text);
+            }
+            return false;
+          }
+          NOOK_RELAY_EOF
+          cat > relay/src/invite_page.js <<'NOOK_RELAY_EOF'
+          // GET /i — the page an invite link opens in a browser. The invite code is
+          // in the URL fragment (#...), which browsers never send to the server, so
+          // NooK Post does not learn who invited whom from this page. The page only
+          // hands the fragment to the NooK app.
+          export const INVITE_PAGE = `<!doctype html>
+          <html lang="en"><head><meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1">
+          <meta name="referrer" content="no-referrer">
+          <title>NooK</title>
+          <style>
+            :root{color-scheme:dark}
+            body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+              background:#1E2D24;color:#F9F6F0;font:17px/1.6 -apple-system,system-ui,"Noto Sans Thai",sans-serif}
+            main{max-width:420px;padding:32px 24px;text-align:center}
+            h1{font-weight:400;letter-spacing:1.5px;margin:0 0 4px}
+            p{color:#B9C7B0}
+            a.btn{display:inline-block;margin-top:20px;padding:14px 28px;border-radius:999px;
+              background:#F9F6F0;color:#1E2D24;text-decoration:none}
+            small{display:block;margin-top:28px;color:#8A9A88}
+          </style></head>
+          <body><main>
+            <h1>NooK</h1>
+            <p id="lead"></p>
+            <a class="btn" id="open" href="nook://invite"></a>
+            <small id="hint"></small>
+          </main>
+          <script>
+            var th = /^th/i.test(navigator.language || '');
+            var t = th
+              ? {lead:'มีคนชวนคุณมาเป็นเพื่อนใน NooK ที่ส่วนตัวสำหรับความทรงจำกับคนที่คุณรัก', open:'เปิดใน NooK', hint:'ยังไม่มี NooK? ติดตั้งก่อน แล้วกลับมาแตะลิงก์นี้อีกครั้ง'}
+              : {lead:'Someone invited you to NooK, a private place for memories with the people you love.', open:'Open in NooK', hint:"Don't have NooK yet? Install it, then tap this link again."};
+            document.documentElement.lang = th ? 'th' : 'en';
+            document.getElementById('lead').textContent = t.lead;
+            document.getElementById('hint').textContent = t.hint;
+            var open = document.getElementById('open');
+            open.textContent = t.open;
+            var code = location.hash.replace(/[^A-Za-z0-9_#=-]/g, '');
+            open.href = 'nook://invite' + code;
+            if (code.length > 1) setTimeout(function(){ location.href = open.href; }, 300);
+          </script>
+          </body></html>`;
+          NOOK_RELAY_EOF
+          cat > relay/src/index.js <<'NOOK_RELAY_EOF'
+          import { DurableObject } from 'cloudflare:workers';
+
+          import { MailboxLogic, SqlStore } from './core.js';
+          import { handle } from './router.js';
+
+          /// One Durable Object per recipient key: its own SQLite file, strongly
+          /// consistent, and deleted envelope by envelope as they are collected.
+          export class Mailbox extends DurableObject {
+            constructor(ctx, env) {
+              super(ctx, env);
+              this.logic = new MailboxLogic(new SqlStore(ctx.storage.sql));
+            }
+
+            async deposit(id, from, text, now) {
+              const result = this.logic.deposit(id, from, text, now);
+              if (result.stored) await this.#scheduleExpiry(now);
+              return result;
+            }
+
+            collect(maxChars, now) {
+              return this.logic.collect(maxChars, now);
+            }
+
+            ack(ids) {
+              return this.logic.ack(ids);
+            }
+
+            setPush(token) {
+              this.logic.setPush(token);
+            }
+
+            clearPush(token) {
+              this.logic.clearPush(token);
+            }
+
+            async alarm() {
+              const next = this.logic.expire(Date.now());
+              if (next !== null) await this.ctx.storage.setAlarm(next);
+            }
+
+            async #scheduleExpiry(now) {
+              if ((await this.ctx.storage.getAlarm()) === null) {
+                const next = this.logic.expire(now);
+                if (next !== null) await this.ctx.storage.setAlarm(next);
+              }
+            }
+          }
+
+          export default {
+            fetch: (request, env, ctx) => handle(request, env, ctx),
+          };
+          NOOK_RELAY_EOF
+          cat > relay/test/relay.test.js <<'NOOK_RELAY_EOF'
+          import assert from 'node:assert/strict';
+          import { test } from 'node:test';
+
+          import {
+            CLOCK_SKEW_MS,
+            MailboxLogic,
+            MemoryStore,
+            PUSH_QUIET_MS,
+            RETENTION_MS,
+            SENDER_HOURLY_LIMIT,
+            b64urlEncode,
+            sha256Hex,
+            signingString,
+          } from '../src/core.js';
+          import { wakeMessage } from '../src/push.js';
+          import { handle } from '../src/router.js';
+
+          const enc = new TextEncoder();
+          const T0 = Date.UTC(2026, 9, 16, 12);
+
+          async function person() {
+            const keys = await crypto.subtle.generateKey({ name: 'Ed25519' }, true, ['sign', 'verify']);
+            const raw = new Uint8Array(await crypto.subtle.exportKey('raw', keys.publicKey));
+            const key = b64urlEncode(raw).replace(/=+$/, '');
+            const identity = 'nook1:' + b64urlEncode(new Uint8Array([...raw, ...new Uint8Array(32).fill(7)]));
+            return { keys, key, identity };
+          }
+
+          function envelope(from, to, ct = 'c2VhbGVk') {
+            return JSON.stringify({ v: 1, from: from.identity, to: to.identity, epk: 'AA', n: 'AA', ct, mac: 'AA', sig: 'AA' });
+          }
+
+          class FakeNamespace {
+            constructor() {
+              this.boxes = new Map();
+            }
+            idFromName(name) {
+              return name;
+            }
+            get(id) {
+              if (!this.boxes.has(id)) this.boxes.set(id, new MailboxLogic(new MemoryStore()));
+              return this.boxes.get(id);
+            }
+          }
+
+          async function call(who, method, path, { body = '', now = T0, serverNow = T0, env, tamper } = {}) {
+            const time = String(now);
+            const message = signingString(method, path, time, await sha256Hex(body));
+            const sig = new Uint8Array(await crypto.subtle.sign({ name: 'Ed25519' }, who.keys.privateKey, enc.encode(message)));
+            const headers = { 'x-nook-key': who.key, 'x-nook-time': time, 'x-nook-sig': b64urlEncode(sig) };
+            const init = { method, headers };
+            if (body && method !== 'GET') init.body = tamper ? body + ' ' : body;
+            const res = await handle(new Request(`https://post.example${path}`, init), env, null, serverNow);
+            return { status: res.status, json: res.headers.get('content-type')?.includes('json') ? await res.json() : null };
+          }
+
+          test('deposit, collect and acknowledge: the mailbox empties after delivery', async () => {
+            const env = { MAILBOX: new FakeNamespace() };
+            const ann = await person();
+            const bo = await person();
+            const env1 = envelope(ann, bo);
+
+            const put = await call(ann, 'POST', `/v1/deposit?to=${bo.key}`, { body: env1, env });
+            assert.equal(put.status, 201);
+            const again = await call(ann, 'POST', `/v1/deposit?to=${bo.key}`, { body: env1, env });
+            assert.equal(again.json.stored, false, 'same envelope is stored once');
+
+            const inbox = await call(bo, 'GET', '/v1/inbox', { env });
+            assert.equal(inbox.json.items.length, 1);
+            assert.equal(inbox.json.items[0].env, env1);
+
+            const ack = await call(bo, 'POST', '/v1/ack', { body: JSON.stringify({ ids: [inbox.json.items[0].id] }), env });
+            assert.equal(ack.json.remaining, 0);
+            assert.equal((await call(bo, 'GET', '/v1/inbox', { env })).json.items.length, 0);
+          });
+
+          test('only the owner can read a mailbox, and only signed, fresh requests pass', async () => {
+            const env = { MAILBOX: new FakeNamespace() };
+            const ann = await person();
+            const bo = await person();
+            await call(ann, 'POST', `/v1/deposit?to=${bo.key}`, { body: envelope(ann, bo), env });
+
+            assert.equal((await call(ann, 'GET', '/v1/inbox', { env })).json.items.length, 0, "Ann sees her own empty box, not Bo's");
+            assert.equal((await call(bo, 'POST', '/v1/ack', { body: '{"ids":[]}', env, tamper: true })).status, 401);
+            const stale = await call(bo, 'GET', '/v1/inbox', { env, now: T0 - CLOCK_SKEW_MS - 1 });
+            assert.equal(stale.status, 401);
+            const unsigned = await handle(new Request('https://post.example/v1/inbox'), env, null, T0);
+            assert.equal(unsigned.status, 401);
+          });
+
+          test("nobody can deposit in someone else's name or for a different mailbox", async () => {
+            const env = { MAILBOX: new FakeNamespace() };
+            const ann = await person();
+            const bo = await person();
+            const eve = await person();
+            const forged = await call(eve, 'POST', `/v1/deposit?to=${bo.key}`, { body: envelope(ann, bo), env });
+            assert.equal(forged.status, 400);
+            const misaddressed = await call(ann, 'POST', `/v1/deposit?to=${eve.key}`, { body: envelope(ann, bo), env });
+            assert.equal(misaddressed.status, 400);
+            assert.equal((await call(ann, 'POST', `/v1/deposit?to=${bo.key}`, { body: 'not json', env })).status, 400);
+          });
+
+          test('banned keys can neither send nor collect', async () => {
+            const ann = await person();
+            const bo = await person();
+            const env = { MAILBOX: new FakeNamespace(), BANNED_KEYS: `${ann.key}` };
+            assert.equal((await call(ann, 'POST', `/v1/deposit?to=${bo.key}`, { body: envelope(ann, bo), env })).status, 403);
+            assert.equal((await call(ann, 'GET', '/v1/inbox', { env })).status, 403);
+            assert.equal((await call(bo, 'POST', `/v1/deposit?to=${ann.key}`, { body: envelope(bo, ann), env })).status, 403);
+          });
+
+          test('a sender is rate limited per mailbox, and old mail expires after 30 days', () => {
+            const box = new MailboxLogic(new MemoryStore());
+            for (let i = 0; i < SENDER_HOURLY_LIMIT; i++) assert.equal(box.deposit(`id${i}`, 'ann', 'x', T0).stored, true);
+            assert.equal(box.deposit('one-more', 'ann', 'x', T0).error, 429);
+            assert.equal(box.deposit('from-bo', 'bo', 'x', T0).stored, true, 'other senders are unaffected');
+            assert.equal(box.deposit('later', 'ann', 'x', T0 + 3600_001).stored, true);
+
+            assert.equal(box.collect(1e9, T0 + RETENTION_MS + 1).items.length, 1, 'only the newest survives');
+          });
+
+          test('collect pages by size but always returns at least one envelope', () => {
+            const box = new MailboxLogic(new MemoryStore());
+            box.deposit('a', 's', 'x'.repeat(600), T0);
+            box.deposit('b', 's', 'y'.repeat(600), T0 + 1);
+            const page = box.collect(1000, T0 + 2);
+            assert.deepEqual(page.items.map((i) => i.id), ['a']);
+            assert.equal(page.more, true);
+            assert.equal(box.collect(10, T0 + 2).items.length, 1);
+          });
+
+          test('wake-ups are throttled and carry no content', () => {
+            const box = new MailboxLogic(new MemoryStore());
+            box.setPush('device-token-123');
+            assert.equal(box.deposit('a', 's', 'x', T0).push, 'device-token-123');
+            assert.equal(box.deposit('b', 's', 'x', T0 + 1000).push, null, 'collapsed into the first');
+            assert.equal(box.deposit('c', 's', 'x', T0 + PUSH_QUIET_MS).push, 'device-token-123');
+            box.clearPush('another-token');
+            assert.equal(box.deposit('d', 's', 'x', T0 + 2 * PUSH_QUIET_MS).push, 'device-token-123', 'stale clear ignored');
+
+            const text = JSON.stringify(wakeMessage('device-token-123'));
+            for (const leak of ['from', 'sender', 'ann', '"body"', '"title"']) assert.ok(!text.includes(leak), leak);
+          });
+
+          test('health check needs no signature', async () => {
+            const res = await handle(new Request('https://post.example/v1/health'), {}, null, T0);
+            assert.equal(await res.text(), 'ok');
+          });
+
+          test('the invite page opens the app and never needs the code server-side', async () => {
+            const res = await handle(new Request('https://post.example/i'), {}, null, T0);
+            assert.equal(res.status, 200);
+            const html = await res.text();
+            assert.match(html, /location\.hash/);
+            assert.match(html, /nook:\/\/invite/);
+            assert.equal(res.headers.get('referrer-policy'), 'no-referrer');
+          });
+          NOOK_RELAY_EOF
+          cat > relay/test/sql_store.test.js <<'NOOK_RELAY_EOF'
+          import assert from 'node:assert/strict';
+          import { DatabaseSync } from 'node:sqlite';
+          import { test } from 'node:test';
+
+          import { CHUNK_CHARS, MailboxLogic, SqlStore } from '../src/core.js';
+
+          /// The Durable Object `ctx.storage.sql` surface, backed by node:sqlite.
+          function doSql() {
+            const db = new DatabaseSync(':memory:');
+            return {
+              exec(query, ...args) {
+                const stmt = db.prepare(query);
+                const rows = /^\s*(SELECT|WITH)/i.test(query) ? stmt.all(...args) : (stmt.run(...args), []);
+                return { toArray: () => rows, one: () => rows[0] };
+              },
+            };
+          }
+
+          test('SqlStore splits large envelopes into chunks and reassembles them', () => {
+            const box = new MailboxLogic(new SqlStore(doSql()));
+            const big = 'a'.repeat(CHUNK_CHARS) + 'b'.repeat(CHUNK_CHARS) + 'tail';
+            assert.equal(box.deposit('big', 'ann', big, 1000).stored, true);
+            assert.equal(box.deposit('small', 'ann', '{}', 1001).stored, true);
+            assert.equal(box.deposit('big', 'ann', big, 1002).duplicate, true);
+            const { items } = box.collect(1e9, 2000);
+            assert.deepEqual(items.map((i) => i.id), ['big', 'small']);
+            assert.equal(items[0].env, big);
+            assert.equal(box.ack(['big']).remaining, 1);
+            assert.equal(box.expire(2000), 1001 + 30 * 24 * 3600 * 1000);
+          });
+
+          test('SqlStore keeps the push token and throttle', () => {
+            const box = new MailboxLogic(new SqlStore(doSql()));
+            box.setPush('tok');
+            assert.equal(box.deposit('a', 's', 'x', 0).push, 'tok');
+            assert.equal(box.deposit('b', 's', 'x', 1).push, null);
+            box.clearPush(null);
+            assert.equal(box.deposit('c', 's', 'x', 10 ** 7).push, null);
+          });
+          NOOK_RELAY_EOF
+          cat > relay/test/smoke.mjs <<'NOOK_RELAY_EOF'
+          // End-to-end check against a running NooK Post: node test/smoke.mjs <base-url>
+          import assert from 'node:assert/strict';
+
+          import { b64urlEncode, sha256Hex, signingString } from '../src/core.js';
+
+          const base = process.argv[2] ?? 'http://localhost:8787';
+          const enc = new TextEncoder();
+
+          async function person() {
+            const keys = await crypto.subtle.generateKey({ name: 'Ed25519' }, true, ['sign', 'verify']);
+            const raw = new Uint8Array(await crypto.subtle.exportKey('raw', keys.publicKey));
+            return {
+              keys,
+              key: b64urlEncode(raw).replace(/=+$/, ''),
+              identity: 'nook1:' + b64urlEncode(new Uint8Array([...raw, ...new Uint8Array(32)])),
+            };
+          }
+
+          async function call(who, method, path, body = '') {
+            const time = String(Date.now());
+            const msg = signingString(method, path, time, await sha256Hex(body));
+            const sig = new Uint8Array(await crypto.subtle.sign({ name: 'Ed25519' }, who.keys.privateKey, enc.encode(msg)));
+            const res = await fetch(base + path, {
+              method,
+              headers: { 'x-nook-key': who.key, 'x-nook-time': time, 'x-nook-sig': b64urlEncode(sig) },
+              body: method === 'GET' ? undefined : body,
+            });
+            return { status: res.status, json: await res.json() };
+          }
+
+          const ann = await person();
+          const bo = await person();
+          const big = JSON.stringify({ v: 1, from: ann.identity, to: bo.identity, ct: 'x'.repeat(3_500_000) });
+          assert.equal((await call(ann, 'POST', `/v1/deposit?to=${bo.key}`, big)).status, 201);
+          assert.equal((await call(bo, 'PUT', '/v1/push', JSON.stringify({ token: 'not-a-real-token' }))).status, 200);
+          const small = JSON.stringify({ v: 1, from: ann.identity, to: bo.identity, ct: 'hi' });
+          assert.equal((await call(ann, 'POST', `/v1/deposit?to=${bo.key}`, small)).status, 201);
+          const inbox = await call(bo, 'GET', '/v1/inbox');
+          assert.equal(inbox.json.items.length, 2);
+          assert.equal(inbox.json.items[0].env, big, '3.5 MB envelope survives chunking');
+          const ack = await call(bo, 'POST', '/v1/ack', JSON.stringify({ ids: inbox.json.items.map((i) => i.id) }));
+          assert.equal(ack.json.remaining, 0);
+          console.log('NooK Post smoke test passed against', base);
+          NOOK_RELAY_EOF
+          cat > relay/package.json <<'NOOK_RELAY_EOF'
+          {
+            "name": "nook-post",
+            "private": true,
+            "type": "module",
+            "devDependencies": {
+              "wrangler": "4.151.1"
+            }
+          }
+          NOOK_RELAY_EOF
+      - run: npm install --no-audit --no-fund
+      - run: node --test test/*.test.js
+      - name: Not deploying
+        if: env.CLOUDFLARE_API_TOKEN == '' || env.CLOUDFLARE_ACCOUNT_ID == ''
+        run: echo "::error::Add the CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID secrets to this repository, then run again." && exit 1
+      - name: Deploy to Cloudflare Workers
+        run: |
+          set -o pipefail
+          npx wrangler deploy 2>&1 | tee deploy.log
+          url=$(grep -oE 'https://[a-zA-Z0-9.-]+\.workers\.dev' deploy.log | head -1)
+          [ -n "$url" ] || { echo "::error::Deployed, but no workers.dev URL was printed. Enable the workers.dev subdomain in Cloudflare."; exit 1; }
+          echo "POST_URL=$url" >> "$GITHUB_ENV"
+      - name: Enable wake-up notifications
+        if: env.FCM_SERVICE_ACCOUNT != ''
+        run: printf '%s' "$FCM_SERVICE_ACCOUNT" | npx wrangler secret put FCM_SERVICE_ACCOUNT
+      - name: Check the live relay
+        run: |
+          node test/smoke.mjs "$POST_URL"
+          echo "::notice title=NooK Post is live::$POST_URL"
