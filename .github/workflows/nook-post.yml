@@ -9,6 +9,8 @@ name: nook-post
 #   CLOUDFLARE_API_TOKEN   Cloudflare token, template "Edit Cloudflare Workers"
 #   CLOUDFLARE_ACCOUNT_ID  Cloudflare dashboard > Workers & Pages > Account ID
 #   FCM_SERVICE_ACCOUNT    optional, Firebase service-account JSON (wake-ups)
+#   GOOGLE_PLAY_SERVICE_ACCOUNT, APPLE_IAP_ISSUER_ID, APPLE_IAP_KEY_ID,
+#   APPLE_IAP_PRIVATE_KEY  optional, let NooK Cloud check store purchases
 # Then: Actions > nook-post > Run workflow.
 on:
   workflow_dispatch:
@@ -26,6 +28,10 @@ jobs:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       FCM_SERVICE_ACCOUNT: ${{ secrets.FCM_SERVICE_ACCOUNT }}
+      GOOGLE_PLAY_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT }}
+      APPLE_IAP_ISSUER_ID: ${{ secrets.APPLE_IAP_ISSUER_ID }}
+      APPLE_IAP_KEY_ID: ${{ secrets.APPLE_IAP_KEY_ID }}
+      APPLE_IAP_PRIVATE_KEY: ${{ secrets.APPLE_IAP_PRIVATE_KEY }}
     defaults:
       run:
         working-directory: relay
@@ -61,8 +67,35 @@ jobs:
           # after a confirmed report. Their deposits and collections are refused.
           BANNED_KEYS = ""
 
+          # Free NooK Cloud space for every vault before any purchase, in bytes, so
+          # backup and restore can be tried on test builds. Set to 0 at launch.
+          VAULT_TRIAL_BYTES = "26214400"
+
+          # Store identities for checking NooK Cloud purchases.
+          ANDROID_PACKAGE = "app.nook.nook"
+          APPLE_BUNDLE_ID = "app.nook.nook"
+
           # Secret (set with `wrangler secret put FCM_SERVICE_ACCOUNT` or by CI):
           #   FCM_SERVICE_ACCOUNT  Firebase service-account JSON, enables wake-ups.
+          #   GOOGLE_PLAY_SERVICE_ACCOUNT  Play Console service account (cloud purchases)
+          #   APPLE_IAP_ISSUER_ID / APPLE_IAP_KEY_ID / APPLE_IAP_PRIVATE_KEY  (App Store)
+
+          # NooK Cloud (end-to-end encrypted vaults). The deploy workflow creates the
+          # R2 bucket; if R2 is not enabled on the account yet, it deploys without
+          # this block and NooK Cloud simply answers "not switched on".
+          [[durable_objects.bindings]]
+          name = "VAULT"
+          class_name = "Vault"
+
+          [[migrations]]
+          tag = "v2"
+          new_sqlite_classes = ["Vault"]
+
+          # NOOK_CLOUD_R2_BEGIN
+          [[r2_buckets]]
+          binding = "VAULT_BLOBS"
+          bucket_name = "nook-vault"
+          # NOOK_CLOUD_R2_END
           NOOK_RELAY_EOF
           cat > relay/src/core.js <<'NOOK_RELAY_EOF'
           // NooK Post: a content-blind mailbox for sealed envelopes.
@@ -333,6 +366,7 @@ jobs:
           } from './core.js';
           import { INVITE_PAGE } from './invite_page.js';
           import { sendPush } from './push.js';
+          import { handleVault } from './vault_routes.js';
 
           const json = (data, status = 200) =>
             new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json' } });
@@ -374,6 +408,10 @@ jobs:
                     'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'",
                   },
                 });
+              }
+
+              if (url.pathname === '/v1/vault' || url.pathname.startsWith('/v1/vault/')) {
+                return await handleVault(request, env, ctx, now, url, { json, banned: (k) => banned(env, k) });
               }
 
               const limit = route === 'POST /v1/deposit' ? MAX_ENVELOPE_CHARS : 64 * 1024;
@@ -567,10 +605,368 @@ jobs:
           </script>
           </body></html>`;
           NOOK_RELAY_EOF
+          cat > relay/src/vault.js <<'NOOK_RELAY_EOF'
+          // NooK Cloud: each person's end-to-end encrypted vault.
+          //
+          // The phone encrypts every object (AES-256-GCM) with a key derived from the
+          // person's 12-word recovery phrase before it leaves the device. The vault is
+          // addressed and signed by a separate Ed25519 key derived from the same
+          // phrase, so it is not linked to the person's NooK identity, name, email
+          // or phone number. Object ids are keyed hashes: the server cannot tell which
+          // object is a memory, a photo or a circle, nor match them across vaults.
+          //
+          // What the server keeps per vault: opaque object ids, their sizes, and the
+          // storage plans paid for (product id + expiry, the purchase token only as a
+          // salted hash). Nothing else.
+
+          import { HttpError, sha256Hex } from './core.js';
+
+          export const GB = 1024 ** 3;
+          export const MB = 1024 ** 2;
+          export const MAX_OBJECT_BYTES = 64 * MB;
+          export const MAX_OBJECTS = 200_000;
+          export const LIST_LIMIT = 1000;
+
+          /// Storage each product grants. A base plan (Premium) sets the tier; add-ons
+          /// stack on top of an active base plan.
+          export const VAULT_PLANS = {
+            nook_premium_monthly: { base: 5 * GB },
+            nook_premium_annual: { base: 50 * GB },
+            nook_cloud_add_50gb: { add: 50 * GB },
+            nook_cloud_add_200gb: { add: 200 * GB },
+          };
+
+          export const OBJECT_ID = /^[a-f0-9]{32}$/;
+
+          /// Quota from the plans active at [now]. [trialBytes] is a small free
+          /// allowance for trying NooK Cloud before any purchase (0 to disable).
+          export function quotaOf(plans, now, trialBytes = 0) {
+            let base = 0;
+            let add = 0;
+            for (const p of plans) {
+              if (p.expires <= now) continue;
+              const plan = VAULT_PLANS[p.product];
+              if (!plan) continue;
+              base = Math.max(base, plan.base ?? 0);
+              add += plan.add ?? 0;
+            }
+            return Math.max(trialBytes, base > 0 ? base + add : 0);
+          }
+
+          /// One vault's bookkeeping (a Durable Object in production). Blobs live in
+          /// R2 under `<vault>/<id>`; this only tracks ids, sizes and plans.
+          export class VaultLogic {
+            constructor(sql) {
+              this.sql = sql;
+              sql.exec('CREATE TABLE IF NOT EXISTS objects (id TEXT PRIMARY KEY, bytes INTEGER NOT NULL, at INTEGER NOT NULL)');
+              sql.exec(
+                'CREATE TABLE IF NOT EXISTS plans (token TEXT PRIMARY KEY, product TEXT NOT NULL, expires INTEGER NOT NULL)',
+              );
+              // Ledger rows (only used in the one ledger object): purchase → vault.
+              sql.exec('CREATE TABLE IF NOT EXISTS claims (token TEXT PRIMARY KEY, vault TEXT NOT NULL)');
+            }
+
+            plans() {
+              return this.sql.exec('SELECT product, expires FROM plans').toArray();
+            }
+
+            used() {
+              const r = this.sql.exec('SELECT COUNT(*) AS c, COALESCE(SUM(bytes), 0) AS b FROM objects').one();
+              return { count: r.c, bytes: r.b };
+            }
+
+            usage(now, trialBytes) {
+              const { count, bytes } = this.used();
+              return {
+                used: bytes,
+                count,
+                quota: quotaOf(this.plans(), now, trialBytes),
+                plans: this.plans().filter((p) => p.expires > now).map((p) => ({ product: p.product, expires: p.expires })),
+              };
+            }
+
+            /// Whether [bytes] more fit under the quota (replacing [id] if present).
+            /// Errors are returned, not thrown, so they survive Durable Object RPC.
+            check(id, bytes, now, trialBytes) {
+              const existing = this.sql.exec('SELECT bytes FROM objects WHERE id = ?', id).toArray()[0]?.bytes ?? 0;
+              const { count, bytes: used } = this.used();
+              if (!existing && count >= MAX_OBJECTS) return { error: 507 };
+              const quota = quotaOf(this.plans(), now, trialBytes);
+              if (used - existing + bytes > quota) return { error: quota === 0 ? 402 : 507, used, quota };
+              return { ok: true };
+            }
+
+            commit(id, bytes, now) {
+              this.sql.exec('INSERT OR REPLACE INTO objects (id, bytes, at) VALUES (?, ?, ?)', id, bytes, now);
+            }
+
+            has(id) {
+              return this.sql.exec('SELECT 1 FROM objects WHERE id = ?', id).toArray().length > 0;
+            }
+
+            list(after, limit) {
+              const rows = this.sql
+                .exec('SELECT id, bytes, at FROM objects WHERE id > ? ORDER BY id LIMIT ?', after ?? '', limit + 1)
+                .toArray();
+              return { objects: rows.slice(0, limit), more: rows.length > limit };
+            }
+
+            remove(id) {
+              this.sql.exec('DELETE FROM objects WHERE id = ?', id);
+            }
+
+            /// Every id, for wiping the vault.
+            wipe() {
+              const ids = this.sql.exec('SELECT id FROM objects').toArray().map((r) => r.id);
+              this.sql.exec('DELETE FROM objects');
+              return ids;
+            }
+
+            grant(token, product, expires) {
+              this.sql.exec('INSERT OR REPLACE INTO plans (token, product, expires) VALUES (?, ?, ?)', token, product, expires);
+            }
+
+            /// Ledger: a purchase can fund exactly one vault. Returns the owner.
+            claim(token, vault) {
+              this.sql.exec('INSERT OR IGNORE INTO claims (token, vault) VALUES (?, ?)', token, vault);
+              return this.sql.exec('SELECT vault FROM claims WHERE token = ?', token).one().vault;
+            }
+          }
+
+          /// A purchase token is never stored as is: only a salted hash, enough to
+          /// recognise the same purchase again.
+          export const tokenHash = (platform, token) => sha256Hex(`nook-vault-token\n${platform}\n${token}`);
+
+          export function trialBytes(env) {
+            const n = Number(env.VAULT_TRIAL_BYTES ?? 0);
+            return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+          }
+
+          export function requireObjectId(id) {
+            if (!OBJECT_ID.test(id ?? '')) throw new HttpError(400, 'bad object id');
+            return id;
+          }
+          NOOK_RELAY_EOF
+          cat > relay/src/vault_routes.js <<'NOOK_RELAY_EOF'
+          // HTTP surface of NooK Cloud. Every request is signed by the vault key
+          // (derived on the phone from the recovery phrase), never by the person's
+          // NooK identity, so cloud storage cannot be tied to who they talk to.
+          //
+          //   GET    /v1/vault                   usage, quota and active plans
+          //   GET    /v1/vault/objects?after=    ids and sizes, 1000 at a time
+          //   PUT    /v1/vault/objects/<id>      store one encrypted object
+          //   GET    /v1/vault/objects/<id>      fetch it
+          //   DELETE /v1/vault/objects/<id>      delete it
+          //   POST   /v1/vault/plans             redeem a store purchase for storage
+          //   DELETE /v1/vault                   erase the whole vault
+
+          import { HttpError, verifyRequest } from './core.js';
+          import { verifyPurchase } from './stores.js';
+          import { LIST_LIMIT, MAX_OBJECT_BYTES, requireObjectId, tokenHash, trialBytes } from './vault.js';
+
+          const LEDGER = '__ledger__';
+
+          async function readBytes(request, limit) {
+            const length = Number(request.headers.get('content-length') ?? 0);
+            if (length > limit) throw new HttpError(413, 'too large');
+            const bytes = new Uint8Array(await request.arrayBuffer());
+            if (bytes.length > limit) throw new HttpError(413, 'too large');
+            return bytes;
+          }
+
+          export async function handleVault(request, env, ctx, now, url, { json, banned }) {
+            if (!env.VAULT || !env.VAULT_BLOBS) throw new HttpError(503, 'NooK Cloud is not switched on');
+            const pathAndQuery = url.pathname + url.search;
+            const putting = request.method === 'PUT';
+            const body = putting ? await readBytes(request, MAX_OBJECT_BYTES) : new TextEncoder().encode(await request.text());
+            if (!putting && body.length > 64 * 1024) throw new HttpError(413, 'too large');
+            const caller = await verifyRequest({ method: request.method, pathAndQuery, headers: request.headers, body, now });
+            if (banned(caller)) throw new HttpError(403, 'not accepted');
+
+            const vault = env.VAULT.get(env.VAULT.idFromName(caller));
+            const trial = trialBytes(env);
+            const blobKey = (id) => `${caller}/${id}`;
+            const parts = url.pathname.split('/').filter(Boolean); // v1, vault, objects?, id?
+            const objectId = parts[2] === 'objects' && parts.length === 4 ? requireObjectId(parts[3]) : null;
+            const route = `${request.method} /${parts.slice(0, 3).join('/')}${objectId ? '/:id' : ''}`;
+
+            switch (route) {
+              case 'GET /v1/vault':
+                return json(await vault.usage(now, trial));
+
+              case 'GET /v1/vault/objects': {
+                const after = url.searchParams.get('after');
+                if (after !== null) requireObjectId(after);
+                return json(await vault.list(after, LIST_LIMIT));
+              }
+
+              case 'PUT /v1/vault/objects/:id': {
+                if (body.length === 0) throw new HttpError(400, 'empty');
+                const room = await vault.check(objectId, body.length, now, trial);
+                if (room.error) {
+                  return json({ error: room.error === 402 ? 'no storage plan' : 'vault full', used: room.used, quota: room.quota }, room.error);
+                }
+                await env.VAULT_BLOBS.put(blobKey(objectId), body);
+                await vault.commit(objectId, body.length, now);
+                return json(await vault.usage(now, trial), 201);
+              }
+
+              case 'GET /v1/vault/objects/:id': {
+                const blob = await env.VAULT_BLOBS.get(blobKey(objectId));
+                if (!blob) throw new HttpError(404, 'not found');
+                return new Response(blob.body, { headers: { 'content-type': 'application/octet-stream', 'cache-control': 'no-store' } });
+              }
+
+              case 'DELETE /v1/vault/objects/:id':
+                await env.VAULT_BLOBS.delete(blobKey(objectId));
+                await vault.remove(objectId);
+                return json(await vault.usage(now, trial));
+
+              case 'POST /v1/vault/plans': {
+                const { platform, product, token } = JSON.parse(new TextDecoder().decode(body) || '{}');
+                const grant = await verifyPurchase(env, platform, product, token, now);
+                const hashed = await tokenHash(platform, token);
+                // One purchase funds one vault, so a token cannot be shared around.
+                const owner = await env.VAULT.get(env.VAULT.idFromName(LEDGER)).claim(hashed, caller);
+                if (owner !== caller) throw new HttpError(409, 'purchase already used by another vault');
+                await vault.grant(hashed, grant.product, grant.expires);
+                return json(await vault.usage(now, trial));
+              }
+
+              case 'DELETE /v1/vault': {
+                const ids = await vault.wipe();
+                for (let i = 0; i < ids.length; i += 1000) {
+                  await env.VAULT_BLOBS.delete(ids.slice(i, i + 1000).map(blobKey));
+                }
+                return json({ erased: ids.length });
+              }
+
+              default:
+                throw new HttpError(404, 'not found');
+            }
+          }
+          NOOK_RELAY_EOF
+          cat > relay/src/stores.js <<'NOOK_RELAY_EOF'
+          // Asks Google Play or the App Store, server to server, whether a NooK
+          // Cloud purchase is real and until when. The phone sends only the store's
+          // opaque purchase token (Android) or transaction id (iOS): no name, no
+          // email, no card, no receipt contents.
+          //
+          // Secrets (all optional; without them purchases cannot be redeemed):
+          //   GOOGLE_PLAY_SERVICE_ACCOUNT  service-account JSON with access to the
+          //                                Play Console app (Android Publisher API)
+          //   APPLE_IAP_ISSUER_ID, APPLE_IAP_KEY_ID, APPLE_IAP_PRIVATE_KEY
+          //                                App Store Connect "In-App Purchase" key
+          // Vars: ANDROID_PACKAGE, APPLE_BUNDLE_ID.
+
+          import { HttpError, b64urlDecode, b64urlEncode } from './core.js';
+          import { VAULT_PLANS } from './vault.js';
+
+          const enc = new TextEncoder();
+          const b64json = (o) => b64urlEncode(enc.encode(JSON.stringify(o))).replace(/=+$/, '');
+
+          function pemBody(pem) {
+            const body = pem.replace(/-----[^-]+-----/g, '').replace(/\s+/g, '');
+            return Uint8Array.from(atob(body), (c) => c.charCodeAt(0));
+          }
+
+          let googleToken = null; // { token, exp }
+
+          async function googleAccess(sa, now) {
+            if (googleToken && googleToken.exp - 60 > now / 1000) return googleToken.token;
+            const iat = Math.floor(now / 1000);
+            const unsigned = `${b64json({ alg: 'RS256', typ: 'JWT' })}.${b64json({
+              iss: sa.client_email,
+              scope: 'https://www.googleapis.com/auth/androidpublisher',
+              aud: 'https://oauth2.googleapis.com/token',
+              iat,
+              exp: iat + 3600,
+            })}`;
+            const key = await crypto.subtle.importKey('pkcs8', pemBody(sa.private_key), { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['sign']);
+            const sig = new Uint8Array(await crypto.subtle.sign('RSASSA-PKCS1-v1_5', key, enc.encode(unsigned)));
+            const res = await fetch('https://oauth2.googleapis.com/token', {
+              method: 'POST',
+              headers: { 'content-type': 'application/x-www-form-urlencoded' },
+              body: `grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=${unsigned}.${b64urlEncode(sig).replace(/=+$/, '')}`,
+            });
+            if (!res.ok) throw new HttpError(503, 'store unavailable');
+            const { access_token, expires_in } = await res.json();
+            googleToken = { token: access_token, exp: iat + (expires_in ?? 3600) };
+            return access_token;
+          }
+
+          /// Google Play subscriptions v2: returns { product, expires } or throws 402.
+          export async function verifyGoogle(env, product, token, now) {
+            if (!env.GOOGLE_PLAY_SERVICE_ACCOUNT || !env.ANDROID_PACKAGE) throw new HttpError(503, 'store not configured');
+            const sa = JSON.parse(env.GOOGLE_PLAY_SERVICE_ACCOUNT);
+            const url =
+              `https://androidpublisher.googleapis.com/androidpublisher/v3/applications/${encodeURIComponent(env.ANDROID_PACKAGE)}` +
+              `/purchases/subscriptionsv2/tokens/${encodeURIComponent(token)}`;
+            const res = await fetch(url, { headers: { authorization: `Bearer ${await googleAccess(sa, now)}` } });
+            if (res.status === 404 || res.status === 400 || res.status === 410) throw new HttpError(402, 'not a purchase');
+            if (!res.ok) throw new HttpError(503, 'store unavailable');
+            const sub = await res.json();
+            const okStates = ['SUBSCRIPTION_STATE_ACTIVE', 'SUBSCRIPTION_STATE_IN_GRACE_PERIOD', 'SUBSCRIPTION_STATE_CANCELED'];
+            if (!okStates.includes(sub.subscriptionState)) throw new HttpError(402, 'not active');
+            const item = (sub.lineItems ?? []).find((i) => i.productId === product);
+            const expires = Date.parse(item?.expiryTime ?? '');
+            if (!item || !Number.isFinite(expires) || expires <= now) throw new HttpError(402, 'not active');
+            return { product, expires };
+          }
+
+          async function appleJwt(env, now) {
+            const iat = Math.floor(now / 1000);
+            const unsigned = `${b64json({ alg: 'ES256', kid: env.APPLE_IAP_KEY_ID, typ: 'JWT' })}.${b64json({
+              iss: env.APPLE_IAP_ISSUER_ID,
+              iat,
+              exp: iat + 600,
+              aud: 'appstoreconnect-v1',
+              bid: env.APPLE_BUNDLE_ID,
+            })}`;
+            const key = await crypto.subtle.importKey('pkcs8', pemBody(env.APPLE_IAP_PRIVATE_KEY), { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
+            const sig = new Uint8Array(await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, key, enc.encode(unsigned)));
+            return `${unsigned}.${b64urlEncode(sig).replace(/=+$/, '')}`;
+          }
+
+          /// App Store Server API: the transaction comes straight from Apple over
+          /// TLS, so its signed payload is read without re-verifying the chain.
+          export async function verifyApple(env, product, transactionId, now) {
+            if (!env.APPLE_IAP_PRIVATE_KEY || !env.APPLE_IAP_KEY_ID || !env.APPLE_IAP_ISSUER_ID || !env.APPLE_BUNDLE_ID) {
+              throw new HttpError(503, 'store not configured');
+            }
+            if (!/^\d{1,30}$/.test(transactionId)) throw new HttpError(400, 'bad transaction');
+            const jwt = await appleJwt(env, now);
+            let res;
+            for (const host of ['api.storekit.itunes.apple.com', 'api.storekit-sandbox.itunes.apple.com']) {
+              res = await fetch(`https://${host}/inApps/v1/transactions/${transactionId}`, { headers: { authorization: `Bearer ${jwt}` } });
+              if (res.status !== 404) break;
+            }
+            if (res.status === 404 || res.status === 400) throw new HttpError(402, 'not a purchase');
+            if (!res.ok) throw new HttpError(503, 'store unavailable');
+            const { signedTransactionInfo } = await res.json();
+            const payload = JSON.parse(new TextDecoder().decode(b64urlDecode(signedTransactionInfo.split('.')[1])));
+            if (payload.bundleId !== env.APPLE_BUNDLE_ID || payload.productId !== product || payload.revocationDate) {
+              throw new HttpError(402, 'not active');
+            }
+            const expires = Number(payload.expiresDate);
+            if (!Number.isFinite(expires) || expires <= now) throw new HttpError(402, 'not active');
+            return { product, expires };
+          }
+
+          export async function verifyPurchase(env, platform, product, token, now) {
+            if (!VAULT_PLANS[product]) throw new HttpError(400, 'unknown product');
+            if (typeof token !== 'string' || token.length < 4 || token.length > 4096) throw new HttpError(400, 'bad token');
+            if (env.VERIFY_PURCHASE) return env.VERIFY_PURCHASE(platform, product, token, now); // tests
+            if (platform === 'android') return verifyGoogle(env, product, token, now);
+            if (platform === 'ios') return verifyApple(env, product, token, now);
+            throw new HttpError(400, 'bad platform');
+          }
+          NOOK_RELAY_EOF
           cat > relay/src/index.js <<'NOOK_RELAY_EOF'
           import { DurableObject } from 'cloudflare:workers';
 
           import { MailboxLogic, SqlStore } from './core.js';
+          import { VaultLogic } from './vault.js';
           import { handle } from './router.js';
 
           /// One Durable Object per recipient key: its own SQLite file, strongly
@@ -613,6 +1009,40 @@ jobs:
                 const next = this.logic.expire(now);
                 if (next !== null) await this.ctx.storage.setAlarm(next);
               }
+            }
+          }
+
+          /// One Durable Object per NooK Cloud vault: ids, sizes and plans only.
+          /// The encrypted blobs themselves live in R2. One extra instance, the
+          /// ledger, remembers which vault each purchase funds.
+          export class Vault extends DurableObject {
+            constructor(ctx, env) {
+              super(ctx, env);
+              this.logic = new VaultLogic(ctx.storage.sql);
+            }
+            usage(now, trial) {
+              return this.logic.usage(now, trial);
+            }
+            check(id, bytes, now, trial) {
+              return this.logic.check(id, bytes, now, trial);
+            }
+            commit(id, bytes, now) {
+              this.logic.commit(id, bytes, now);
+            }
+            list(after, limit) {
+              return this.logic.list(after, limit);
+            }
+            remove(id) {
+              this.logic.remove(id);
+            }
+            wipe() {
+              return this.logic.wipe();
+            }
+            grant(token, product, expires) {
+              this.logic.grant(token, product, expires);
+            }
+            claim(token, vault) {
+              return this.logic.claim(token, vault);
             }
           }
 
@@ -820,6 +1250,181 @@ jobs:
             assert.equal(box.deposit('c', 's', 'x', 10 ** 7).push, null);
           });
           NOOK_RELAY_EOF
+          cat > relay/test/vault.test.js <<'NOOK_RELAY_EOF'
+          import assert from 'node:assert/strict';
+          import { DatabaseSync } from 'node:sqlite';
+          import { test } from 'node:test';
+
+          import { b64urlEncode, sha256Hex, signingString } from '../src/core.js';
+          import { handle } from '../src/router.js';
+          import { HttpError } from '../src/core.js';
+          import { GB, MB, VaultLogic, quotaOf } from '../src/vault.js';
+
+          const enc = new TextEncoder();
+          const T0 = Date.UTC(2026, 9, 18, 12);
+          const DAY = 24 * 3600 * 1000;
+
+          function doSql() {
+            const db = new DatabaseSync(':memory:');
+            return {
+              exec(query, ...args) {
+                const stmt = db.prepare(query);
+                const rows = /^\s*(SELECT|WITH)/i.test(query) ? stmt.all(...args) : (stmt.run(...args), []);
+                return { toArray: () => rows, one: () => rows[0] };
+              },
+            };
+          }
+
+          class Vaults {
+            constructor() {
+              this.all = new Map();
+            }
+            idFromName(n) {
+              return n;
+            }
+            get(id) {
+              if (!this.all.has(id)) this.all.set(id, new VaultLogic(doSql()));
+              return this.all.get(id);
+            }
+          }
+
+          class FakeR2 {
+            constructor() {
+              this.blobs = new Map();
+            }
+            async put(k, v) {
+              this.blobs.set(k, new Uint8Array(v));
+            }
+            async get(k) {
+              const v = this.blobs.get(k);
+              return v ? { body: v } : null;
+            }
+            async delete(k) {
+              for (const key of Array.isArray(k) ? k : [k]) this.blobs.delete(key);
+            }
+          }
+
+          function makeEnv(extra = {}) {
+            return {
+              MAILBOX: null,
+              VAULT: new Vaults(),
+              VAULT_BLOBS: new FakeR2(),
+              VAULT_TRIAL_BYTES: '0',
+              VERIFY_PURCHASE: async (platform, product, token, now) => {
+                if (!token.startsWith('paid')) throw new HttpError(402, 'not a purchase');
+                return { product, expires: now + 30 * DAY };
+              },
+              ...extra,
+            };
+          }
+
+          async function vaultKey() {
+            const keys = await crypto.subtle.generateKey({ name: 'Ed25519' }, true, ['sign', 'verify']);
+            const raw = new Uint8Array(await crypto.subtle.exportKey('raw', keys.publicKey));
+            return { keys, key: b64urlEncode(raw).replace(/=+$/, '') };
+          }
+
+          async function call(who, method, path, { body, env, now = T0 } = {}) {
+            const bytes = body === undefined ? new Uint8Array() : typeof body === 'string' ? enc.encode(body) : body;
+            const time = String(now);
+            const msg = signingString(method, path, time, await sha256Hex(bytes));
+            const sig = new Uint8Array(await crypto.subtle.sign({ name: 'Ed25519' }, who.keys.privateKey, enc.encode(msg)));
+            const init = { method, headers: { 'x-nook-key': who.key, 'x-nook-time': time, 'x-nook-sig': b64urlEncode(sig) } };
+            if (bytes.length && method !== 'GET') init.body = bytes;
+            const res = await handle(new Request(`https://post.example${path}`, init), env, null, now);
+            const type = res.headers.get('content-type') ?? '';
+            return { status: res.status, json: type.includes('json') ? await res.json() : null, bytes: type.includes('octet') ? new Uint8Array(await res.arrayBuffer()) : null };
+          }
+
+          const id = (n) => n.toString(16).padStart(32, '0');
+
+          test('plans set the quota: 5 GB monthly, 50 GB annual, add-ons stack on a base plan', () => {
+            const live = T0 + DAY;
+            assert.equal(quotaOf([{ product: 'nook_premium_monthly', expires: live }], T0), 5 * GB);
+            assert.equal(quotaOf([{ product: 'nook_premium_annual', expires: live }], T0), 50 * GB);
+            assert.equal(
+              quotaOf(
+                [
+                  { product: 'nook_premium_annual', expires: live },
+                  { product: 'nook_cloud_add_50gb', expires: live },
+                  { product: 'nook_cloud_add_200gb', expires: live },
+                ],
+                T0,
+              ),
+              300 * GB,
+            );
+            assert.equal(quotaOf([{ product: 'nook_cloud_add_200gb', expires: live }], T0), 0, 'add-ons need Premium');
+            assert.equal(quotaOf([{ product: 'nook_premium_annual', expires: T0 - 1 }], T0, 25 * MB), 25 * MB, 'expired falls back to trial');
+          });
+
+          test('a vault stores, lists, returns and deletes opaque objects, within its quota', async () => {
+            const env = makeEnv({ VAULT_TRIAL_BYTES: '100' });
+            const me = await vaultKey();
+            const blob = new Uint8Array(60).fill(9);
+
+            assert.equal((await call(me, 'PUT', `/v1/vault/objects/${id(1)}`, { body: blob, env })).status, 201);
+            const usage = await call(me, 'GET', '/v1/vault', { env });
+            assert.deepEqual([usage.json.used, usage.json.count, usage.json.quota], [60, 1, 100]);
+
+            const full = await call(me, 'PUT', `/v1/vault/objects/${id(2)}`, { body: blob, env });
+            assert.equal(full.status, 507);
+            assert.equal((await call(me, 'PUT', `/v1/vault/objects/${id(1)}`, { body: new Uint8Array(90), env })).status, 201, 'replacing counts once');
+
+            const got = await call(me, 'GET', `/v1/vault/objects/${id(1)}`, { env });
+            assert.equal(got.bytes.length, 90);
+            assert.deepEqual((await call(me, 'GET', '/v1/vault/objects', { env })).json.objects.map((o) => o.id), [id(1)]);
+
+            // Someone else's vault is separate, even with the same object id.
+            const other = await vaultKey();
+            assert.equal((await call(other, 'GET', `/v1/vault/objects/${id(1)}`, { env })).status, 404);
+
+            assert.equal((await call(me, 'DELETE', `/v1/vault/objects/${id(1)}`, { env })).json.used, 0);
+            assert.equal(env.VAULT_BLOBS.blobs.size, 0);
+            assert.equal((await call(me, 'PUT', `/v1/vault/objects/not-hex`, { body: blob, env })).status, 400);
+          });
+
+          test('without a plan there is no space; a verified purchase opens it, once', async () => {
+            const env = makeEnv();
+            const me = await vaultKey();
+            const r = await call(me, 'PUT', `/v1/vault/objects/${id(1)}`, { body: new Uint8Array(10), env });
+            assert.equal(r.status, 402);
+
+            const fake = await call(me, 'POST', '/v1/vault/plans', { body: JSON.stringify({ platform: 'android', product: 'nook_premium_monthly', token: 'forged' }), env });
+            assert.equal(fake.status, 402);
+
+            const ok = await call(me, 'POST', '/v1/vault/plans', { body: JSON.stringify({ platform: 'android', product: 'nook_premium_monthly', token: 'paid-1' }), env });
+            assert.equal(ok.status, 200);
+            assert.equal(ok.json.quota, 5 * GB);
+            await call(me, 'POST', '/v1/vault/plans', { body: JSON.stringify({ platform: 'android', product: 'nook_cloud_add_50gb', token: 'paid-2' }), env });
+            assert.equal((await call(me, 'GET', '/v1/vault', { env })).json.quota, 55 * GB);
+
+            const thief = await vaultKey();
+            const reuse = await call(thief, 'POST', '/v1/vault/plans', { body: JSON.stringify({ platform: 'android', product: 'nook_premium_monthly', token: 'paid-1' }), env });
+            assert.equal(reuse.status, 409, 'one purchase funds one vault');
+
+            // The server never keeps the raw purchase token.
+            const stored = JSON.stringify([...env.VAULT.all.values()].map((v) => v.sql.exec('SELECT * FROM plans').toArray().concat(v.sql.exec('SELECT * FROM claims').toArray())));
+            assert.equal(stored.includes('paid-1'), false);
+
+            assert.equal((await call(me, 'GET', '/v1/vault', { env, now: T0 + 31 * DAY })).json.quota, 0, 'lapses with the subscription');
+          });
+
+          test('erasing a vault removes every blob', async () => {
+            const env = makeEnv({ VAULT_TRIAL_BYTES: String(MB) });
+            const me = await vaultKey();
+            for (let i = 0; i < 5; i++) await call(me, 'PUT', `/v1/vault/objects/${id(i)}`, { body: new Uint8Array(8), env });
+            assert.equal((await call(me, 'DELETE', '/v1/vault', { env })).json.erased, 5);
+            assert.equal(env.VAULT_BLOBS.blobs.size, 0);
+          });
+
+          test('unsigned or tampered requests and a missing bucket are refused', async () => {
+            const env = makeEnv({ VAULT_TRIAL_BYTES: '100' });
+            const res = await handle(new Request('https://post.example/v1/vault', { method: 'GET' }), env, null, T0);
+            assert.equal(res.status, 401);
+            const me = await vaultKey();
+            assert.equal((await call(me, 'GET', '/v1/vault', { env: makeEnv({ VAULT_BLOBS: undefined }) })).status, 503);
+          });
+          NOOK_RELAY_EOF
           cat > relay/test/smoke.mjs <<'NOOK_RELAY_EOF'
           // End-to-end check against a running NooK Post: node test/smoke.mjs <base-url>
           import assert from 'node:assert/strict';
@@ -880,6 +1485,19 @@ jobs:
       - name: Not deploying
         if: env.CLOUDFLARE_API_TOKEN == '' || env.CLOUDFLARE_ACCOUNT_ID == ''
         run: echo "::error::Add the CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID secrets to this repository, then run again." && exit 1
+      - name: Prepare NooK Cloud storage
+        run: |
+          npx wrangler r2 bucket create nook-vault >/dev/null 2>&1 || true
+          if npx wrangler r2 bucket list 2>/dev/null | grep -q 'nook-vault'; then
+            echo "NooK Cloud bucket ready"
+          else
+            python3 - <<'PY'
+          import re
+          s = open('wrangler.toml').read()
+          open('wrangler.toml', 'w').write(re.sub(r'# NOOK_CLOUD_R2_BEGIN.*?# NOOK_CLOUD_R2_END\n', '', s, flags=re.S))
+          PY
+            echo "::warning title=NooK Cloud is off::Turn on R2 in the Cloudflare dashboard (R2 Object Storage), then run this workflow again. NooK Post works without it."
+          fi
       - name: Deploy to Cloudflare Workers
         run: |
           set -o pipefail
@@ -890,6 +1508,12 @@ jobs:
       - name: Enable wake-up notifications
         if: env.FCM_SERVICE_ACCOUNT != ''
         run: printf '%s' "$FCM_SERVICE_ACCOUNT" | npx wrangler secret put FCM_SERVICE_ACCOUNT
+      - name: Store keys for NooK Cloud purchases
+        run: |
+          for name in GOOGLE_PLAY_SERVICE_ACCOUNT APPLE_IAP_ISSUER_ID APPLE_IAP_KEY_ID APPLE_IAP_PRIVATE_KEY; do
+            value="${!name}"
+            if [ -n "$value" ]; then printf '%s' "$value" | npx wrangler secret put "$name"; fi
+          done
       - name: Check the live relay
         run: |
           node test/smoke.mjs "$POST_URL"
